@@ -172,6 +172,23 @@ class MoGeViewer:
         self.bottom_panel_height = 80  # Reduced from 120
         self.ui_animation_speed = 0.15
         self.ui_animations = {}  # Store animation states
+        
+        # Post-processing settings
+        self.enable_post_processing = True
+        self.post_process_sharpening = 0.0  # 0.0 to 1.0
+        self.post_process_saturation = 1.0  # 0.0 to 2.0
+        self.post_process_contrast = 1.0  # 0.5 to 2.0
+        self.post_process_brightness = 0.0  # -1.0 to 1.0
+        self.post_process_gamma = 1.0  # 0.5 to 2.0
+        self.post_process_color_temp = 0.0  # -1.0 to 1.0 (cold to warm)
+        self.post_process_vignette = 0.0  # 0.0 to 1.0
+        self.post_process_noise_reduction = 0.0  # 0.0 to 1.0
+        self.post_process_edge_enhance = 0.0  # 0.0 to 1.0
+        self.post_process_hue_shift = 0.0  # -180 to 180 degrees
+        self.show_post_process_panel = False  # Toggle for collapsible panel
+        
+        # Input processing settings
+        self.input_resolution_scale = 1.0  # 0.1 to 1.0 - scale input before model
     
     def load_model(self, on_complete_callback=None):
         """Load MoGe model in background"""
@@ -775,6 +792,9 @@ class MoGeViewer:
                     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     height, width = image.shape[:2]
                     
+                    # Apply post-processing
+                    image = self.apply_post_processing(image)
+                    
                     # Convert to tensor
                     image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
                     image_tensor = image_tensor.permute(2, 0, 1)
@@ -1128,12 +1148,114 @@ class MoGeViewer:
         # Process frame in background
         threading.Thread(target=self._process_frame, args=(frame,), daemon=True).start()
     
+    def apply_post_processing(self, image):
+        """Apply post-processing effects to an image"""
+        if not self.enable_post_processing:
+            return image
+            
+        img = image.copy()
+        height, width = img.shape[:2]
+        
+        # Convert to float for processing
+        img_float = img.astype(np.float32) / 255.0
+        
+        # Brightness adjustment
+        if self.post_process_brightness != 0.0:
+            img_float = np.clip(img_float + self.post_process_brightness, 0, 1)
+        
+        # Contrast adjustment
+        if self.post_process_contrast != 1.0:
+            img_float = np.clip((img_float - 0.5) * self.post_process_contrast + 0.5, 0, 1)
+        
+        # Saturation adjustment in HSV
+        if self.post_process_saturation != 1.0:
+            hsv = cv2.cvtColor(img_float, cv2.COLOR_RGB2HSV)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * self.post_process_saturation, 0, 1)
+            img_float = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        
+        # Gamma correction
+        if self.post_process_gamma != 1.0:
+            img_float = np.power(img_float, 1.0 / self.post_process_gamma)
+        
+        # Color temperature adjustment
+        if self.post_process_color_temp != 0.0:
+            # Simple temperature adjustment - modify red and blue channels
+            temp_factor = self.post_process_color_temp
+            if temp_factor > 0:  # Warmer
+                img_float[:, :, 0] = np.clip(img_float[:, :, 0] * (1 + temp_factor * 0.3), 0, 1)  # Red
+                img_float[:, :, 2] = np.clip(img_float[:, :, 2] * (1 - temp_factor * 0.3), 0, 1)  # Blue
+            else:  # Cooler
+                img_float[:, :, 0] = np.clip(img_float[:, :, 0] * (1 + temp_factor * 0.3), 0, 1)  # Red
+                img_float[:, :, 2] = np.clip(img_float[:, :, 2] * (1 - temp_factor * 0.3), 0, 1)  # Blue
+        
+        # Hue shift
+        if self.post_process_hue_shift != 0.0:
+            hsv = cv2.cvtColor(img_float, cv2.COLOR_RGB2HSV)
+            hsv[:, :, 0] = (hsv[:, :, 0] + self.post_process_hue_shift / 360.0) % 1.0
+            img_float = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        
+        # Convert back to uint8 for effects that need it
+        img_uint8 = (img_float * 255).astype(np.uint8)
+        
+        # Sharpening
+        if self.post_process_sharpening > 0.0:
+            kernel = np.array([[-1, -1, -1],
+                              [-1,  9, -1],
+                              [-1, -1, -1]])
+            sharpened = cv2.filter2D(img_uint8, -1, kernel)
+            img_uint8 = cv2.addWeighted(img_uint8, 1.0 - self.post_process_sharpening, 
+                                       sharpened, self.post_process_sharpening, 0)
+        
+        # Edge enhancement
+        if self.post_process_edge_enhance > 0.0:
+            edges = cv2.Canny(cv2.cvtColor(img_uint8, cv2.COLOR_RGB2GRAY), 50, 150)
+            edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+            img_uint8 = cv2.addWeighted(img_uint8, 1.0, edges_colored, 
+                                       self.post_process_edge_enhance * 0.3, 0)
+        
+        # Noise reduction
+        if self.post_process_noise_reduction > 0.0:
+            # Use bilateral filter for edge-preserving smoothing
+            d = int(5 + self.post_process_noise_reduction * 10)
+            img_uint8 = cv2.bilateralFilter(img_uint8, d, 75, 75)
+        
+        # Convert back to float for vignette
+        img_float = img_uint8.astype(np.float32) / 255.0
+        
+        # Vignette effect
+        if self.post_process_vignette > 0.0:
+            # Create radial gradient
+            cy, cx = height // 2, width // 2
+            Y, X = np.ogrid[:height, :width]
+            dist_from_center = np.sqrt((X - cx)**2 + (Y - cy)**2)
+            max_dist = np.sqrt(cx**2 + cy**2)
+            vignette_mask = 1.0 - (dist_from_center / max_dist) * self.post_process_vignette
+            vignette_mask = np.clip(vignette_mask, 0, 1)
+            # Apply vignette
+            img_float = img_float * vignette_mask[:, :, np.newaxis]
+        
+        # Convert back to uint8
+        result = (img_float * 255).astype(np.uint8)
+        
+        return result
+    
     def _process_frame(self, frame):
         """Process a single frame to 3D"""
         try:
             # Convert BGR to RGB
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            original_height, original_width = image.shape[:2]
+            
+            # Apply input resolution scaling
+            if self.input_resolution_scale != 1.0:
+                new_width = int(original_width * self.input_resolution_scale)
+                new_height = int(original_height * self.input_resolution_scale)
+                image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
             height, width = image.shape[:2]
+            
+            # Apply post-processing
+            image = self.apply_post_processing(image)
             
             # Convert to tensor
             image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
@@ -1255,16 +1377,27 @@ class MoGeViewer:
             try:
                 # Load image
                 image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
-                height, width = image.shape[:2]
+                original_height, original_width = image.shape[:2]
                 
                 # Resize if too large (but keep good quality)
                 max_size = 1280
-                if max(height, width) > max_size:
-                    scale = max_size / max(height, width)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
+                if max(original_height, original_width) > max_size:
+                    scale = max_size / max(original_height, original_width)
+                    new_width = int(original_width * scale)
+                    new_height = int(original_height * scale)
                     image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                    height, width = new_height, new_width
+                    original_height, original_width = new_height, new_width
+                
+                # Apply input resolution scaling
+                if self.input_resolution_scale != 1.0:
+                    new_width = int(original_width * self.input_resolution_scale)
+                    new_height = int(original_height * self.input_resolution_scale)
+                    image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                
+                height, width = image.shape[:2]
+                
+                # Apply post-processing
+                image = self.apply_post_processing(image)
                 
                 # Convert to tensor
                 image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
@@ -1801,6 +1934,12 @@ class MoGeViewer:
             imgui.separator()
             imgui.spacing()
             
+            self.render_post_processing(content_width)
+            
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+            
             self.render_mesh_status(content_width)
             
             imgui.spacing()
@@ -1912,6 +2051,19 @@ class MoGeViewer:
         button_width = content_width
         button_height = 28
         
+        # Input Resolution Scale
+        imgui.push_item_width(content_width - 80)
+        changed, self.input_resolution_scale = imgui.slider_float(
+            "Input Resolution", 
+            self.input_resolution_scale, 
+            0.1, 1.0, "%.2fx"
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Scale input resolution before model processing\n(Lower = faster, higher = better quality)")
+        imgui.pop_item_width()
+        
+        imgui.spacing()
+        
         # Camera button
         camera_active_color = (0.45, 0.55, 0.95, 1.0) if self.camera_active else (0.20, 0.21, 0.22, 1.0)
         imgui.push_style_color(imgui.COLOR_BUTTON, *camera_active_color[:3], camera_active_color[3])
@@ -2022,6 +2174,139 @@ class MoGeViewer:
         for key, action in controls:
             imgui.text(f"{key}: {action}")
         imgui.pop_style_color()
+    
+    def render_post_processing(self, content_width):
+        """Render post-processing options"""
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
+        imgui.text("POST PROCESSING")
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Enable checkbox
+        changed, self.enable_post_processing = imgui.checkbox("Enable Post-Processing", self.enable_post_processing)
+        
+        if self.enable_post_processing:
+            imgui.spacing()
+            
+            # Basic adjustments
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+            imgui.text("Basic Adjustments")
+            imgui.pop_style_color()
+            
+            # Resolution scale removed - now in Input Sources
+            imgui.push_item_width(content_width - 80)
+            
+            # Brightness
+            changed, self.post_process_brightness = imgui.slider_float(
+                "Brightness", 
+                self.post_process_brightness, 
+                -1.0, 1.0, "%.2f"
+            )
+            
+            # Contrast
+            changed, self.post_process_contrast = imgui.slider_float(
+                "Contrast", 
+                self.post_process_contrast, 
+                0.5, 2.0, "%.2f"
+            )
+            
+            # Saturation
+            changed, self.post_process_saturation = imgui.slider_float(
+                "Saturation", 
+                self.post_process_saturation, 
+                0.0, 2.0, "%.2f"
+            )
+            
+            # Gamma
+            changed, self.post_process_gamma = imgui.slider_float(
+                "Gamma", 
+                self.post_process_gamma, 
+                0.5, 2.0, "%.2f"
+            )
+            
+            imgui.spacing()
+            
+            # Advanced adjustments
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+            imgui.text("Advanced Effects")
+            imgui.pop_style_color()
+            
+            # Sharpening
+            changed, self.post_process_sharpening = imgui.slider_float(
+                "Sharpening", 
+                self.post_process_sharpening, 
+                0.0, 1.0, "%.2f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Enhance edge sharpness")
+            
+            # Edge enhancement
+            changed, self.post_process_edge_enhance = imgui.slider_float(
+                "Edge Enhance", 
+                self.post_process_edge_enhance, 
+                0.0, 1.0, "%.2f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Emphasize object boundaries")
+            
+            # Noise reduction
+            changed, self.post_process_noise_reduction = imgui.slider_float(
+                "Denoise", 
+                self.post_process_noise_reduction, 
+                0.0, 1.0, "%.2f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Reduce image noise")
+            
+            imgui.spacing()
+            
+            # Color adjustments
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+            imgui.text("Color Grading")
+            imgui.pop_style_color()
+            
+            # Color temperature
+            changed, self.post_process_color_temp = imgui.slider_float(
+                "Temperature", 
+                self.post_process_color_temp, 
+                -1.0, 1.0, "%.2f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adjust color warmth: negative = cooler, positive = warmer")
+            
+            # Hue shift
+            changed, self.post_process_hue_shift = imgui.slider_float(
+                "Hue Shift", 
+                self.post_process_hue_shift, 
+                -180.0, 180.0, "%.0f°"
+            )
+            
+            # Vignette
+            changed, self.post_process_vignette = imgui.slider_float(
+                "Vignette", 
+                self.post_process_vignette, 
+                0.0, 1.0, "%.2f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Darken image edges")
+            
+            imgui.pop_item_width()
+            
+            imgui.spacing()
+            
+            # Reset button
+            if imgui.button("Reset All", content_width):
+                self.post_process_sharpening = 0.0
+                self.post_process_saturation = 1.0
+                self.post_process_contrast = 1.0
+                self.post_process_brightness = 0.0
+                self.post_process_gamma = 1.0
+                self.post_process_color_temp = 0.0
+                self.post_process_vignette = 0.0
+                self.post_process_noise_reduction = 0.0
+                self.post_process_edge_enhance = 0.0
+                self.post_process_hue_shift = 0.0
     
     def render_video_controls(self):
         """Render video player controls"""
