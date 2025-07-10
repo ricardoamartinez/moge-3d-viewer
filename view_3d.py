@@ -1,0 +1,2813 @@
+#!/usr/bin/env python3
+"""
+MoGe OpenGL 3D Viewer with Drag-and-Drop
+High-performance viewer using VBOs - no quality loss
+Flying camera controls: WASD + QE
+"""
+
+import os
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
+import sys
+import tempfile
+import cv2
+import torch
+import numpy as np
+import pygame
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+from OpenGL.arrays import vbo
+import ctypes
+import utils3d
+from pathlib import Path
+import threading
+import queue
+import time
+import mss
+import imgui
+from imgui.integrations.pygame import PygameRenderer
+from collections import deque, OrderedDict
+import math
+import subprocess
+
+# Add MoGe to path
+if (_package_root := str(Path(__file__).absolute().parent)) not in sys.path:
+    sys.path.insert(0, _package_root)
+
+from moge.model.v2 import MoGeModel
+from moge.utils.vis import colorize_depth
+
+class MoGeViewer:
+    def __init__(self):
+        # Available models (version, name, description)
+        self.available_models = [
+            ("v2", "Ruicheng/moge-2-vitl", "MoGe v2 - ViT-L (326M)"),
+            ("v2", "Ruicheng/moge-2-vitl-normal", "MoGe v2 - ViT-L Normal (331M)"),
+            ("v2", "Ruicheng/moge-2-vitb-normal", "MoGe v2 - ViT-B Normal (104M)"),
+            ("v2", "Ruicheng/moge-2-vits-normal", "MoGe v2 - ViT-S Normal (35M)"),
+        ]
+        self.current_model_index = 1  # Start with v2 ViT-L Normal (full capabilities)
+        
+        # Model
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.loading = False
+        self.processing = False
+        
+        # Camera streaming
+        self.camera_stream = None
+        self.camera_thread = None
+        self.camera_active = False
+        self.frame_queue = queue.Queue(maxsize=2)  # Small queue to drop old frames
+        self.last_process_time = 0
+        self.min_process_interval = 0.1  # Minimum time between processing frames
+        
+        # Screen capture
+        self.screen_thread = None
+        self.screen_active = False
+        self.screen_scale = 0.5  # Scale down screen capture for performance
+        self.selected_window = None  # Selected window for capture
+        
+        # Video playback
+        self.video_path = None
+        self.video_capture = None
+        self.video_thread = None
+        self.video_active = False
+        self.video_playing = False
+        self.video_fps = 30.0
+        self.video_total_frames = 0
+        self.video_current_frame = 0
+        self.video_buffer_size = 600  # Default buffer size (20s at 30fps)
+        self.video_frame_buffer = deque(maxlen=self.video_buffer_size)
+        self.video_buffer_thread = None
+        self.video_live_mode = False  # Live mode drops frames to keep up
+        self.video_loop = True  # Loop video by default
+        self.video_seek_requested = False
+        self.video_seek_frame = 0
+        self.video_last_frame_time = 0
+        self.video_lock = threading.Lock()  # Thread safety for video state
+        self.video_is_seeking = False  # Track seek operations
+        self.video_scale = 1.0  # Scale factor for video frames (unused now - always full res)
+        self.video_resize_scale = 1.0  # User configurable resize scale (unused now)
+        
+        # Mesh caching for video frames
+        self.mesh_cache = OrderedDict()  # frame_num -> mesh_data (LRU cache)
+        self.max_mesh_cache = 1800  # ~1 minute at 30fps, adjust based on memory
+        self.processed_frames = set()  # Set of frame numbers that have been processed
+        self.video_processor_thread = None  # Thread for processing frames to 3D
+        self.video_processing_active = False  # Flag for processor thread
+        self._current_displayed_frame = -1  # Track what frame is currently displayed
+        
+        # Mesh data
+        self.vertices = None
+        self.faces = None
+        self.vertex_colors = None
+        self.vertex_normals = None
+        self.has_mesh = False
+        
+        # Pending mesh data (set by background threads)
+        self.pending_mesh = None
+        self.mesh_lock = threading.Lock()
+        
+        # Thumbnail lock to prevent race conditions
+        self.thumbnail_lock = threading.Lock()
+        self.window_thumbnails = {}  # Will store OpenGL texture IDs
+        self.thumbnail_textures = {}  # Store texture data: {window_id: texture_id}
+        
+        # VBO data
+        self.vertex_vbo = None
+        self.color_vbo = None
+        self.normal_vbo = None
+        self.index_vbo = None
+        self.num_faces = 0
+        
+        # Camera - Flying FPS style
+        self.camera_pos = np.array([0.0, 0.0, 3.0])  # Start closer to origin
+        self.camera_front = np.array([0.0, 0.0, -1.0])  # Looking towards negative Z
+        self.camera_up = np.array([0.0, 1.0, 0.0])
+        self.camera_speed = 0.1
+        self.mouse_sensitivity = 0.3  # Increased for better FPS control
+        self.yaw = -90.0  # Looking down negative Z axis
+        self.pitch = 0.0
+        
+        # Window
+        self.width = 1400
+        self.height = 900
+        self.fullscreen = False
+        self.windowed_size = (1400, 900)  # Store windowed size for toggle back
+        self.mouse_captured = False
+        self.last_mouse_x = self.width // 2
+        self.last_mouse_y = self.height // 2
+        self.left_mouse_held = False
+        self.right_mouse_held = False
+        
+        # Display options
+        self.wireframe = False
+        self.show_axes = True
+        self.use_vbo = True
+        self.show_help = False
+        self.smooth_edges = True  # Toggle for edge smoothing
+        
+        # Status messages
+        self.status_message = "Drag and drop an image or video to start"
+        self.mesh_info = ""
+        
+        # Add mesh status info
+        # ImGui UI State
+        self.imgui_renderer = None
+        self.show_window_selector_dialog = False
+        self.window_selector_result = None
+        self.show_main_ui = True
+        self.show_sidebar = True  # Toggle for sidebar visibility
+        self.sidebar_animation_target = 1.0  # 1.0 = fully open, 0.0 = fully closed
+        self.sidebar_animation_current = 1.0  # Current animation state
+        self.sidebar_animation_speed = 8.0  # Animation speed
+        self.show_settings_panel = False
+        self.show_video_controls = False
+        self.ui_style = 'modern'  # UI style
+        
+        # UI Layout
+        self.sidebar_width = 200  # Reduced from 280
+        self.bottom_panel_height = 80  # Reduced from 120
+        self.ui_animation_speed = 0.15
+        self.ui_animations = {}  # Store animation states
+    
+    def load_model(self, on_complete_callback=None):
+        """Load MoGe model in background"""
+        if self.model is None and not self.loading:
+            self.loading = True
+            version, model_name, description = self.available_models[self.current_model_index]
+            self.status_message = f"Loading {description}..."
+            
+            def _load():
+                print(f"Loading {description} ({model_name})...")
+                
+                # Import the correct model class
+                if version == "v1":
+                    from moge.model.v1 import MoGeModel
+                else:  # v2
+                    from moge.model.v2 import MoGeModel
+                
+                self.model = MoGeModel.from_pretrained(model_name).to(self.device).eval()
+                if self.device.type == "cuda":
+                    self.model.half()
+                self.loading = False
+                self.status_message = f"{description} loaded! Drag and drop an image"
+                print(f"{description} loaded!")
+                
+                # Call the completion callback if provided
+                if on_complete_callback:
+                    on_complete_callback()
+                
+            threading.Thread(target=_load, daemon=True).start()
+    
+    def switch_model(self, direction):
+        """Switch to next/previous model"""
+        if self.loading or self.processing:
+            return
+            
+        # Remember current mode before stopping
+        was_camera_active = self.camera_active
+        was_screen_active = self.screen_active
+        was_video_active = self.video_active
+        video_path = self.video_path
+        
+        # Update status to show switching in progress
+        current_mode_text = ""
+        if was_camera_active:
+            current_mode_text = " | Will resume camera mode"
+        elif was_screen_active:
+            current_mode_text = " | Will resume screen mode"
+        elif was_video_active:
+            current_mode_text = " | Will resume video"
+        
+        # Stop any active streaming
+        if self.camera_active:
+            self.stop_camera()
+        if self.screen_active:
+            self.stop_screen()
+        if self.video_active:
+            self.stop_video()
+            
+        # Clear current mesh
+        self.has_mesh = False
+        self.vertices = None
+        self.faces = None
+        self.vertex_colors = None
+        self.vertex_normals = None
+        self.delete_vbos()
+        
+        # Clear current model
+        if self.model is not None:
+            del self.model
+            self.model = None
+            # Force garbage collection
+            import gc
+            gc.collect()
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+        
+        # Switch model index if direction is specified
+        if direction != 0:
+            if direction > 0:  # Right arrow
+                self.current_model_index = (self.current_model_index + 1) % len(self.available_models)
+            else:  # Left arrow
+                self.current_model_index = (self.current_model_index - 1) % len(self.available_models)
+        
+        # Update status to show what's happening
+        version, model_name, description = self.available_models[self.current_model_index]
+        self.status_message = f"Switching to {description}...{current_mode_text}"
+        
+        # Load new model with callback to restore mode
+        def restore_mode_after_load():
+            # Restore the previous mode
+            if was_camera_active:
+                self.start_camera()
+            elif was_screen_active:
+                self.start_screen()
+            elif was_video_active and video_path:
+                self.start_video(video_path)
+        
+        # Load new model
+        if was_camera_active or was_screen_active or was_video_active:
+            self.load_model(restore_mode_after_load)
+        else:
+            self.load_model()
+    
+    def get_current_model_info(self):
+        """Get current model information"""
+        version, model_name, description = self.available_models[self.current_model_index]
+        return description
+    
+    def start_camera(self):
+        """Start camera streaming"""
+        if self.camera_active or self.model is None or self.loading:
+            return
+            
+        try:
+            self.camera_stream = cv2.VideoCapture(0)
+            if not self.camera_stream.isOpened():
+                self.status_message = "Failed to open camera"
+                return
+                
+            # Set camera properties for better performance
+            self.camera_stream.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.camera_stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.camera_stream.set(cv2.CAP_PROP_FPS, 30)
+            
+            self.camera_active = True
+            self.status_message = "Camera mode active"
+            
+            # Start capture thread
+            self.camera_thread = threading.Thread(target=self._capture_frames, daemon=True)
+            self.camera_thread.start()
+            
+        except Exception as e:
+            self.status_message = f"Camera error: {str(e)}"
+            print(f"Failed to start camera: {e}")
+    
+    def stop_camera(self):
+        """Stop camera streaming"""
+        self.camera_active = False
+        if self.camera_stream is not None:
+            self.camera_stream.release()
+            self.camera_stream = None
+        
+        # Clear the queue
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except:
+                pass
+                
+        self.status_message = "Camera mode stopped"
+    
+    def capture_window_thumbnail_simple(self, window_id):
+        """Capture a window thumbnail - returns numpy array"""
+        try:
+            # Use larger thumbnail size to match the larger display
+            thumb_width, thumb_height = 180, 100  # Increased from 100x70
+            
+            if window_id:
+                # Capture specific window using import command
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        # Use import to capture and resize in one go
+                        cmd = f"import -window {window_id} -resize {thumb_width}x{thumb_height}! {tmp.name}"
+                        result = subprocess.run(cmd, shell=True, capture_output=True, timeout=0.5)
+                        if result.returncode == 0 and os.path.exists(tmp.name):
+                            # Read image
+                            img = cv2.imread(tmp.name)
+                            os.unlink(tmp.name)
+                            if img is not None:
+                                # Convert BGR to RGB for OpenGL
+                                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                                print(f"Captured window {window_id}: shape={img_rgb.shape}, dtype={img_rgb.dtype}")
+                                return img_rgb
+                        else:
+                            print(f"Import command failed for window {window_id}: {result.stderr.decode() if result.stderr else 'Unknown error'}")
+                except Exception as e:
+                    print(f"Error with import for window {window_id}: {e}")
+            else:
+                # Capture full screen
+                try:
+                    with mss.mss() as sct:
+                        monitor = sct.monitors[1]
+                        # Capture screenshot
+                        screenshot = sct.grab(monitor)
+                        # Convert to numpy array - mss returns BGRA format
+                        img = np.array(screenshot)
+                        
+                        # Convert BGRA to RGB
+                        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                        
+                        # Resize to thumbnail
+                        thumb = cv2.resize(img_rgb, (thumb_width, thumb_height), interpolation=cv2.INTER_AREA)
+                        print(f"Captured fullscreen: shape={thumb.shape}, dtype={thumb.dtype}")
+                        return thumb
+                except Exception as e:
+                    print(f"Error with mss: {e}")
+            
+        except Exception as e:
+            print(f"Error capturing thumbnail: {e}")
+            
+        return None
+    
+    def get_window_list(self):
+        """Get list of available windows"""
+        try:
+            windows = []
+            
+            # Add full screen option first
+            windows.append({
+                'id': None,
+                'title': 'Full Screen',
+                'full_title': 'Capture entire screen'
+            })
+            
+            # Use xwininfo to get window list
+            cmd = "xwininfo -tree -root | grep '\"' | grep -v '\"i3bar\"' | grep -v '\"<unknown>\"' | head -15"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                for i, line in enumerate(lines):
+                    # Extract window ID and title
+                    parts = line.strip().split('"')
+                    if len(parts) >= 2:
+                        title = parts[1]
+                        # Extract window ID (0x...)
+                        window_id = line.split()[0]
+                        windows.append({
+                            'id': window_id,
+                            'title': title[:50] + ('...' if len(title) > 50 else ''),
+                            'full_title': title
+                        })
+            
+            return windows
+            
+        except Exception as e:
+            print(f"Error getting window list: {e}")
+            return [{'id': None, 'title': 'Full Screen', 'full_title': 'Capture entire screen'}]
+    
+    def capture_and_create_thumbnails(self, windows):
+        """Capture thumbnails and create OpenGL textures progressively"""
+        # Clear old data
+        self.cleanup_thumbnail_textures()
+        with self.thumbnail_lock:
+            self.window_thumbnails.clear()
+        
+        def capture_thumbnails_async():
+            """Capture thumbnails in background and signal when ready"""
+            for i, window in enumerate(windows[:8]):  # Limit to 8 windows for performance
+                if not self.show_window_selector_dialog:
+                    break  # Stop if dialog closed
+                    
+                window_id = window['id']
+                
+                # Skip if already captured
+                if window_id in self.thumbnail_textures:
+                    continue
+                
+                # Capture thumbnail
+                thumb_data = self.capture_window_thumbnail_simple(window_id)
+                if thumb_data is not None:
+                    # Store raw data for main thread to create texture
+                    with self.thumbnail_lock:
+                        self.window_thumbnails[window_id] = thumb_data
+                        
+                # Small delay between captures
+                time.sleep(0.05)
+        
+        # Start capturing in background
+        threading.Thread(target=capture_thumbnails_async, daemon=True).start()
+    
+    def cleanup_thumbnail_textures(self):
+        """Clean up all thumbnail textures"""
+        for window_id, texture_id in self.thumbnail_textures.items():
+            try:
+                glDeleteTextures([texture_id])
+            except:
+                pass
+        self.thumbnail_textures.clear()
+    
+    def process_captured_thumbnails(self):
+        """Process captured thumbnail data and create OpenGL textures on main thread"""
+        # Check if we have any thumbnails to process
+        with self.thumbnail_lock:
+            # Get list of windows that have captured data but no texture
+            to_process = [(wid, data) for wid, data in self.window_thumbnails.items() 
+                         if wid not in self.thumbnail_textures and isinstance(data, np.ndarray)]
+        
+        # Create textures for each captured thumbnail
+        for window_id, thumb_data in to_process:
+            try:
+                # Create OpenGL texture
+                height, width = thumb_data.shape[:2]
+                texture_id = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, texture_id)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, 
+                           GL_RGB, GL_UNSIGNED_BYTE, thumb_data)
+                glBindTexture(GL_TEXTURE_2D, 0)
+                
+                # Store texture ID
+                self.thumbnail_textures[window_id] = texture_id
+                print(f"Created texture for window: {window_id}")
+            except Exception as e:
+                print(f"Error creating texture: {e}")
+    
+    def show_window_selector(self):
+        """Show window selector and prepare thumbnails"""
+        self.show_window_selector_dialog = True
+        self.window_selector_result = None
+        # Window list and thumbnails will be created when dialog renders
+        return None  # Let the main loop handle the dialog
+    
+    def start_screen(self):
+        """Start screen capture"""
+        if self.screen_active or self.model is None or self.loading:
+            return
+        
+        # Stop camera if active
+        if self.camera_active:
+            self.stop_camera()
+            
+        try:
+            # Show window selector dialog
+            self.show_window_selector()
+            # The actual screen capture will be started when a window is selected in the dialog
+            
+        except Exception as e:
+            self.status_message = f"Screen capture error: {str(e)}"
+            print(f"Failed to start screen capture: {e}")
+    
+    def stop_screen(self):
+        """Stop screen capture"""
+        self.screen_active = False
+        self.selected_window = None
+        
+        # Clear the queue
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except:
+                pass
+                
+        self.status_message = "Screen capture mode stopped"
+    
+    def open_file_dialog(self):
+        """Open native OS file dialog to select image or video"""
+        def _open_dialog():
+            try:
+                # Try zenity first (most Linux distributions)
+                cmd = [
+                    'zenity', '--file-selection',
+                    '--title=Select an image or video file',
+                    '--file-filter=All Supported Files | *.jpg *.jpeg *.JPG *.JPEG *.png *.PNG *.bmp *.BMP *.mp4 *.MP4 *.avi *.AVI *.mov *.MOV *.mkv *.MKV *.webm *.WEBM *.flv *.FLV *.wmv *.WMV *.m4v *.M4V *.3gp *.3GP *.ogv *.OGV',
+                    '--file-filter=Image Files | *.jpg *.jpeg *.JPG *.JPEG *.png *.PNG *.bmp *.BMP *.gif *.GIF *.tiff *.TIFF *.tga *.TGA *.webp *.WEBP',
+                    '--file-filter=Video Files | *.mp4 *.MP4 *.avi *.AVI *.mov *.MOV *.mkv *.MKV *.webm *.WEBM *.flv *.FLV *.wmv *.WMV *.m4v *.M4V *.3gp *.3GP *.ogv *.OGV *.mpg *.MPG *.mpeg *.MPEG',
+                    '--file-filter=All Files | *'
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    filename = result.stdout.strip()
+                    self.handle_drop(filename)
+                    return
+                    
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                # Zenity not available, try kdialog (KDE)
+                try:
+                    cmd = [
+                        'kdialog', '--getopenfilename', 
+                        os.path.expanduser("~"),
+                        'All Supported (*.jpg *.jpeg *.JPG *.JPEG *.png *.PNG *.bmp *.BMP *.mp4 *.MP4 *.avi *.AVI *.mov *.MOV *.mkv *.MKV *.webm *.WEBM *.flv *.FLV *.wmv *.WMV *.m4v *.M4V *.3gp *.3GP *.ogv *.OGV);;Images (*.jpg *.jpeg *.JPG *.JPEG *.png *.PNG *.bmp *.BMP *.gif *.GIF *.tiff *.TIFF *.tga *.TGA *.webp *.WEBP);;Videos (*.mp4 *.MP4 *.avi *.AVI *.mov *.MOV *.mkv *.MKV *.webm *.WEBM *.flv *.FLV *.wmv *.WMV *.m4v *.M4V *.3gp *.3GP *.ogv *.OGV *.mpg *.MPG *.mpeg *.MPEG);;All Files (*)'
+                    ]
+                    
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    if result.returncode == 0 and result.stdout.strip():
+                        filename = result.stdout.strip()
+                        self.handle_drop(filename)
+                        return
+                        
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    print("No native file dialog available (zenity or kdialog required)")
+                    self.status_message = "Native file dialog not available - install zenity or kdialog"
+        
+        # Run in a separate thread to avoid blocking
+        threading.Thread(target=_open_dialog, daemon=True).start()
+    
+    def start_video(self, video_path):
+        """Start video playback"""
+        if self.video_active or self.model is None or self.loading:
+            return
+            
+        try:
+            # Stop other capture modes
+            if self.camera_active:
+                self.stop_camera()
+            if self.screen_active:
+                self.stop_screen()
+                
+            # Open video
+            self.video_capture = cv2.VideoCapture(video_path)
+            if not self.video_capture.isOpened():
+                self.status_message = f"Failed to open video: {Path(video_path).name}"
+                return
+                
+            # Get video properties
+            self.video_fps = self.video_capture.get(cv2.CAP_PROP_FPS) or 30.0
+            self.video_total_frames = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # No scaling - always process at full resolution
+            self.video_scale = 1.0
+            
+            with self.video_lock:
+                self.video_current_frame = 0
+                self.video_path = video_path
+                self.video_is_seeking = False
+                
+                # Clear caches
+                self.mesh_cache.clear()
+                self.processed_frames.clear()
+                self._current_displayed_frame = -1
+            
+            # Clear buffers
+            self.video_frame_buffer.clear()
+            while not self.frame_queue.empty():
+                try:
+                    self.frame_queue.get_nowait()
+                except:
+                    pass
+            
+            self.video_active = True
+            self.video_playing = False  # Start paused for initial buffering
+            self.video_processing_active = True
+            self.show_video_controls = True
+            
+            # Calculate video duration
+            total_seconds = self.video_total_frames / self.video_fps
+            minutes = int(total_seconds // 60)
+            seconds = int(total_seconds % 60)
+            self.status_message = f"Buffering video: {Path(video_path).name} ({minutes:02d}:{seconds:02d})"
+            
+            # Start buffer thread (for raw frames)
+            self.video_buffer_thread = threading.Thread(target=self._buffer_video_frames, daemon=True)
+            self.video_buffer_thread.start()
+            
+            # Start processor thread (for 3D conversion)
+            self.video_processor_thread = threading.Thread(target=self._process_video_frames, daemon=True)
+            self.video_processor_thread.start()
+            
+            # Start playback thread
+            self.video_thread = threading.Thread(target=self._play_video, daemon=True)
+            self.video_thread.start()
+            
+        except Exception as e:
+            self.status_message = f"Video error: {str(e)}"
+            print(f"Failed to start video: {e}")
+    
+    def stop_video(self):
+        """Stop video playback"""
+        self.video_active = False
+        self.video_playing = False
+        self.video_processing_active = False
+        self.show_video_controls = False
+        
+        # Release video capture early
+        if self.video_capture is not None:
+            self.video_capture.release()
+            self.video_capture = None
+            
+        # Try to join threads with timeout
+        if self.video_buffer_thread and self.video_buffer_thread.is_alive():
+            self.video_buffer_thread.join(timeout=1.0)
+        if self.video_processor_thread and self.video_processor_thread.is_alive():
+            self.video_processor_thread.join(timeout=1.0)
+        if self.video_thread and self.video_thread.is_alive():
+            self.video_thread.join(timeout=1.0)
+            
+                # Clear buffers and caches
+        with self.video_lock:
+            self.video_frame_buffer.clear()
+            self.mesh_cache.clear()
+            self.processed_frames.clear()
+            
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except:
+                pass
+                
+        self.status_message = "Video stopped"
+    
+    def toggle_video_playback(self):
+        """Toggle video play/pause"""
+        if self.video_active:
+            with self.video_lock:
+                self.video_playing = not self.video_playing
+                if self.video_playing:
+                    self.video_last_frame_time = time.time()
+                    self.status_message = "Video playing"
+                else:
+                    self.status_message = "Video paused"
+    
+    def seek_video(self, frame_number):
+        """Seek to specific frame in video"""
+        if self.video_active and self.video_capture:
+            frame_number = max(0, min(frame_number, self.video_total_frames - 1))
+            
+            with self.video_lock:
+                # Check if frame is already cached
+                if frame_number in self.mesh_cache:
+                    # Instant seek to cached frame
+                    self.video_current_frame = frame_number
+                    self._current_displayed_frame = frame_number
+                    
+                    # Display the cached mesh immediately
+                    mesh_data = self.mesh_cache[frame_number]
+                    with self.mesh_lock:
+                        self.pending_mesh = {
+                            'vertices': mesh_data['vertices'],
+                            'faces': mesh_data['faces'],
+                            'vertex_colors': mesh_data['vertex_colors'],
+                            'vertex_normals': mesh_data['vertex_normals'],
+                            'center': None,
+                            'scale': None
+                        }
+                    
+                    self.status_message = "Video playing" if self.video_playing else "Video paused"
+                    self.video_last_frame_time = time.time()
+                else:
+                    # Need to seek and buffer
+                    was_playing = self.video_playing
+                    self.video_playing = False  # Pause during seek
+                    self.video_is_seeking = True
+                    
+                    # Set seek request
+                    self.video_seek_requested = True
+                    self.video_seek_frame = frame_number
+                    
+                    # Clear raw frame buffer to force re-buffering from seek point
+                    self.video_frame_buffer.clear()
+                    
+                    # Update status
+                    self.status_message = "Seeking..."
+                    
+                    # Resume after some frames are processed
+                    def resume_after_buffer():
+                        # Wait for frame to be processed
+                        wait_time = 0
+                        while wait_time < 5.0:  # Max 5 seconds wait
+                            time.sleep(0.1)
+                            wait_time += 0.1
+                            with self.video_lock:
+                                if frame_number in self.mesh_cache:
+                                    self.video_is_seeking = False
+                                    if was_playing:
+                                        self.video_playing = True
+                                        self.video_last_frame_time = time.time()
+                                    break
+                        else:
+                            # Timeout - resume anyway
+                            with self.video_lock:
+                                self.video_is_seeking = False
+                                if was_playing:
+                                    self.video_playing = True
+                                    self.video_last_frame_time = time.time()
+                            
+                    threading.Thread(target=resume_after_buffer, daemon=True).start()
+    
+    def _process_video_frames(self):
+        """Process video frames to 3D meshes in background"""
+        while self.video_processing_active:
+            try:
+                # Get next unprocessed frame from buffer
+                frame_to_process = None
+                with self.video_lock:
+                    # Find first unprocessed frame in buffer
+                    for frame_data in self.video_frame_buffer:
+                        frame_num = frame_data['number']
+                        if frame_num not in self.processed_frames:
+                            frame_to_process = frame_data
+                            break
+                
+                if frame_to_process is None:
+                    # No unprocessed frames available
+                    time.sleep(0.01)
+                    continue
+                
+                # Process the frame
+                frame = frame_to_process['frame']
+                frame_num = frame_to_process['number']
+                
+                try:
+                    # Convert BGR to RGB
+                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    height, width = image.shape[:2]
+                    
+                    # Convert to tensor
+                    image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+                    image_tensor = image_tensor.permute(2, 0, 1)
+                    
+                    # Run inference
+                    with torch.no_grad():
+                        output = self.model.infer(image_tensor, use_fp16=(self.device.type == "cuda"))
+                    
+                    # Extract outputs
+                    points = output['points'].cpu().numpy()
+                    depth = output['depth'].cpu().numpy()
+                    mask = output['mask'].cpu().numpy()
+                    normal = output.get('normal')
+                    if normal is not None:
+                        normal = normal.cpu().numpy()
+                    
+                    # Clean mask
+                    if self.smooth_edges:
+                        depth_smooth = cv2.GaussianBlur(depth, (3, 3), 0.5)
+                        mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+                    else:
+                        mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth, rtol=0.04)
+                    
+                    # Create mesh
+                    if normal is None:
+                        faces, vertices, vertex_colors, _ = utils3d.numpy.image_mesh(
+                            points,
+                            image.astype(np.float32) / 255,
+                            utils3d.numpy.image_uv(width=width, height=height),
+                            mask=mask_cleaned,
+                            tri=True
+                        )
+                        vertex_normals = None
+                    else:
+                        faces, vertices, vertex_colors, _, vertex_normals = utils3d.numpy.image_mesh(
+                            points,
+                            image.astype(np.float32) / 255,
+                            utils3d.numpy.image_uv(width=width, height=height),
+                            normal,
+                            mask=mask_cleaned,
+                            tri=True
+                        )
+                    
+                    # Convert coordinates
+                    vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
+                    if vertex_normals is not None:
+                        vertex_normals = vertex_normals * np.array([1, -1, -1], dtype=np.float32)
+                    
+                    # Cache the mesh data
+                    mesh_data = {
+                        'vertices': vertices,
+                        'faces': faces,
+                        'vertex_colors': vertex_colors,
+                        'vertex_normals': vertex_normals
+                    }
+                    
+                    with self.video_lock:
+                        # Add to cache
+                        self.mesh_cache[frame_num] = mesh_data
+                        self.processed_frames.add(frame_num)
+                        
+                        # Maintain cache size limit (LRU)
+                        if len(self.mesh_cache) > self.max_mesh_cache:
+                            # Remove oldest entry
+                            self.mesh_cache.popitem(last=False)
+                        
+                        # Update status
+                        processed_count = len(self.processed_frames)
+                        percent = (processed_count / self.video_total_frames) * 100
+                        self.status_message = f"Processing: {percent:.1f}% ({processed_count}/{self.video_total_frames} frames)"
+                        
+                        # Auto-play when enough frames are buffered
+                        if not self.video_playing and processed_count >= 30:  # 1 second buffered
+                            self.video_playing = True
+                            self.video_last_frame_time = time.time()
+                    
+                except Exception as e:
+                    print(f"Error processing frame {frame_num}: {e}")
+                    # Mark as processed anyway to avoid getting stuck
+                    with self.video_lock:
+                        self.processed_frames.add(frame_num)
+                    
+            except Exception as e:
+                print(f"Error in video processor thread: {e}")
+                time.sleep(0.1)
+    
+    def _buffer_video_frames(self):
+        """Buffer video frames in background"""
+        while self.video_active:
+            try:
+                # Handle seek requests
+                if self.video_seek_requested:
+                    self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.video_seek_frame)
+                    with self.video_lock:
+                        self.video_current_frame = self.video_seek_frame
+                        self.video_seek_requested = False
+                        self.video_frame_buffer.clear()
+                
+                # Buffer frames if not full
+                if len(self.video_frame_buffer) < self.video_frame_buffer.maxlen:
+                    ret, frame = self.video_capture.read()
+                    if ret:
+                        # No resizing - keep full resolution
+                        with self.video_lock:
+                            self.video_frame_buffer.append({
+                                'frame': frame,
+                                'number': self.video_current_frame
+                            })
+                            self.video_current_frame += 1
+                    else:
+                        # End of video
+                        if self.video_loop:
+                            # Loop video
+                            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            with self.video_lock:
+                                self.video_current_frame = 0
+                        else:
+                            # Stop at end
+                            with self.video_lock:
+                                self.video_playing = False
+                            self.status_message = "Video ended"
+                            time.sleep(0.5)  # Avoid busy loop at end
+                else:
+                    # Buffer is full
+                    with self.video_lock:
+                        if not self.video_playing:
+                            # Longer sleep when paused to reduce CPU usage
+                            time.sleep(0.5)
+                        else:
+                            time.sleep(0.01)  # Short sleep when playing
+                    
+            except Exception as e:
+                print(f"Error buffering video: {e}")
+                self.video_active = False
+                self.status_message = "Video error"
+                time.sleep(0.1)
+    
+    def _play_video(self):
+        """Play video frames at correct FPS using cached meshes"""
+        frame_interval = 1.0 / self.video_fps
+        self.video_last_frame_time = time.time()
+        
+        while self.video_active:
+            try:
+                with self.video_lock:
+                    playing = self.video_playing
+                    current_frame = self.video_current_frame
+                    
+                if playing:
+                    current_time = time.time()
+                    elapsed = current_time - self.video_last_frame_time
+                    
+                    if elapsed >= frame_interval:
+                        # Determine next frame to display
+                        next_frame = current_frame
+                        
+                        with self.video_lock:
+                            if self.video_live_mode:
+                                # In live mode, skip to latest processed frame
+                                frames_behind = int(elapsed / frame_interval)
+                                target_frame = min(current_frame + frames_behind, self.video_total_frames - 1)
+                                
+                                # Find latest processed frame up to target
+                                for f in range(target_frame, current_frame - 1, -1):
+                                    if f in self.mesh_cache:
+                                        next_frame = f
+                                        break
+                            else:
+                                # Normal mode - play each frame in sequence
+                                next_frame = current_frame + 1
+                                if next_frame >= self.video_total_frames:
+                                    if self.video_loop:
+                                        next_frame = 0
+                                    else:
+                                        self.video_playing = False
+                                        self.status_message = "Video ended"
+                                        continue
+                        
+                            # Wait if frame not processed yet
+                            if next_frame not in self.mesh_cache:
+                                # Check if it will never be processed (beyond buffer)
+                                if next_frame not in self.processed_frames:
+                                    self.status_message = "Buffering..."
+                                    time.sleep(0.01)
+                                    continue
+                        
+                        # Display the frame if we have it cached
+                        if next_frame in self.mesh_cache:
+                            mesh_data = self.mesh_cache[next_frame]
+                            
+                            # Update mesh for display
+                            with self.mesh_lock:
+                                self.pending_mesh = {
+                                    'vertices': mesh_data['vertices'],
+                                    'faces': mesh_data['faces'],
+                                    'vertex_colors': mesh_data['vertex_colors'],
+                                    'vertex_normals': mesh_data['vertex_normals'],
+                                    'center': None,  # Don't reset camera
+                                    'scale': None
+                                }
+                            
+                            # Update current frame
+                            with self.video_lock:
+                                self.video_current_frame = next_frame
+                                self._current_displayed_frame = next_frame
+                                
+                                # Update status
+                                if self.status_message.startswith("Buffering") or self.status_message.startswith("Processing"):
+                                    self.status_message = "Video playing"
+                        
+                        self.video_last_frame_time = current_time
+                else:
+                    # Not playing
+                    time.sleep(0.01)
+                    
+            except Exception as e:
+                print(f"Error playing video: {e}")
+                time.sleep(0.01)
+    
+    def _capture_frames(self):
+        """Capture frames from camera in separate thread"""
+        while self.camera_active and self.camera_stream is not None:
+            ret, frame = self.camera_stream.read()
+            if ret:
+                # Try to put frame in queue, drop old frames if full
+                try:
+                    self.frame_queue.put_nowait(frame)
+                except queue.Full:
+                    # Drop oldest frame and add new one
+                    try:
+                        self.frame_queue.get_nowait()
+                        self.frame_queue.put_nowait(frame)
+                    except:
+                        pass
+            else:
+                time.sleep(0.01)
+    
+    def _capture_screen(self):
+        """Capture screen frames in separate thread"""
+        try:
+            # Initialize mss in the thread where it will be used
+            with mss.mss() as sct:
+                while self.screen_active:
+                    try:
+                        # Determine what to capture
+                        if self.selected_window and self.selected_window['id']:
+                            # Capture specific window
+                            import subprocess
+                            
+                            # Get window geometry using xwininfo
+                            cmd = f"xwininfo -id {self.selected_window['id']} | grep -E 'Absolute upper-left X:|Absolute upper-left Y:|Width:|Height:'"
+                            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                            
+                            if result.returncode == 0:
+                                lines = result.stdout.strip().split('\n')
+                                x = y = width = height = 0
+                                
+                                for line in lines:
+                                    if 'Absolute upper-left X:' in line:
+                                        x = int(line.split(':')[1].strip())
+                                    elif 'Absolute upper-left Y:' in line:
+                                        y = int(line.split(':')[1].strip())
+                                    elif 'Width:' in line:
+                                        width = int(line.split(':')[1].strip())
+                                    elif 'Height:' in line:
+                                        height = int(line.split(':')[1].strip())
+                                
+                                # Define monitor region for the window
+                                monitor = {
+                                    'left': x,
+                                    'top': y,
+                                    'width': width,
+                                    'height': height
+                                }
+                            else:
+                                # Fallback to full screen
+                                monitor = sct.monitors[1]
+                        else:
+                            # Capture the primary monitor (full screen)
+                            monitor = sct.monitors[1]  # Monitor 1 is the primary display (0 is all monitors combined)
+                        
+                        # Capture screen
+                        screenshot = sct.grab(monitor)
+                        
+                        # Convert to numpy array (BGRA -> BGR)
+                        frame = np.array(screenshot)[:, :, :3]
+                        
+                        # Scale down if needed for performance
+                        if self.screen_scale < 1.0:
+                            height, width = frame.shape[:2]
+                            new_width = int(width * self.screen_scale)
+                            new_height = int(height * self.screen_scale)
+                            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                        
+                        # Try to put frame in queue, drop old frames if full
+                        try:
+                            self.frame_queue.put_nowait(frame)
+                        except queue.Full:
+                            # Drop oldest frame and add new one
+                            try:
+                                self.frame_queue.get_nowait()
+                                self.frame_queue.put_nowait(frame)
+                            except:
+                                pass
+                        
+                        # Small delay to control frame rate
+                        time.sleep(0.033)  # ~30 FPS
+                        
+                    except Exception as e:
+                        if self.screen_active:  # Only print error if we're still supposed to be capturing
+                            print(f"Error capturing screen: {e}")
+                        time.sleep(0.1)
+        except Exception as e:
+            print(f"Failed to initialize screen capture: {e}")
+            self.screen_active = False
+            self.status_message = "Screen capture failed"
+    
+    def process_frame(self):
+        """Process the latest frame from camera or screen if available"""
+        # Skip for video mode - video has its own processor thread
+        if (not self.camera_active and not self.screen_active) or self.processing or self.video_active:
+            return
+            
+        # Check if enough time has passed since last processing
+        current_time = time.time()
+        if current_time - self.last_process_time < self.min_process_interval:
+            return
+            
+        # Get latest frame
+        frame = None
+        while not self.frame_queue.empty():
+            try:
+                frame = self.frame_queue.get_nowait()
+            except:
+                break
+                
+        if frame is None:
+            return
+            
+        self.last_process_time = current_time
+        self.processing = True
+        
+        # Update status for normal playback if buffer restored
+        if self.video_active:
+            with self.video_lock:
+                if self.video_playing and len(self.video_frame_buffer) > 30:
+                    # Buffer restored, clear buffering message
+                    if self.status_message == "Buffering...":
+                        self.status_message = "Video playing"
+        
+        # Process frame in background
+        threading.Thread(target=self._process_frame, args=(frame,), daemon=True).start()
+    
+    def _process_frame(self, frame):
+        """Process a single frame to 3D"""
+        try:
+            # Convert BGR to RGB
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            height, width = image.shape[:2]
+            
+            # Convert to tensor
+            image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+            image_tensor = image_tensor.permute(2, 0, 1)
+            
+            # Run inference
+            with torch.no_grad():
+                output = self.model.infer(image_tensor, use_fp16=(self.device.type == "cuda"))
+            
+            # Extract outputs
+            points = output['points'].cpu().numpy()
+            depth = output['depth'].cpu().numpy()
+            mask = output['mask'].cpu().numpy()
+            normal = output.get('normal')
+            if normal is not None:
+                normal = normal.cpu().numpy()
+            
+            # Clean mask
+            if self.smooth_edges:
+                # Apply simple smoothing to depth for cleaner edges
+                # Use gaussian blur which works well with float32
+                depth_smooth = cv2.GaussianBlur(depth, (3, 3), 0.5)
+                mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+            else:
+                # Standard edge detection without smoothing
+                mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth, rtol=0.04)
+            
+            # Create mesh
+            if normal is None:
+                faces, vertices, vertex_colors, _ = utils3d.numpy.image_mesh(
+                    points,
+                    image.astype(np.float32) / 255,
+                    utils3d.numpy.image_uv(width=width, height=height),
+                    mask=mask_cleaned,
+                    tri=True
+                )
+                vertex_normals = None
+            else:
+                faces, vertices, vertex_colors, _, vertex_normals = utils3d.numpy.image_mesh(
+                    points,
+                    image.astype(np.float32) / 255,
+                    utils3d.numpy.image_uv(width=width, height=height),
+                    normal,
+                    mask=mask_cleaned,
+                    tri=True
+                )
+            
+            # Convert coordinates
+            vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
+            if vertex_normals is not None:
+                vertex_normals = vertex_normals * np.array([1, -1, -1], dtype=np.float32)
+            
+            # Store mesh data for main thread to process
+            with self.mesh_lock:
+                self.pending_mesh = {
+                    'vertices': vertices,
+                    'faces': faces,
+                    'vertex_colors': vertex_colors,
+                    'vertex_normals': vertex_normals,
+                    'center': None,  # Don't reset camera for realtime
+                    'scale': None
+                }
+            
+        except Exception as e:
+            print(f"Error processing frame: {e}")
+        finally:
+            self.processing = False
+    
+    def create_vbos(self):
+        """Create Vertex Buffer Objects for efficient rendering"""
+        if self.vertices is None:
+            return
+            
+        # Delete old VBOs if they exist
+        self.delete_vbos()
+        
+        # Prepare vertex data
+        vertex_data = self.vertices.astype(np.float32)
+        color_data = self.vertex_colors.astype(np.float32)
+        index_data = self.faces.astype(np.uint32)
+        
+        # Create VBOs
+        self.vertex_vbo = vbo.VBO(vertex_data)
+        self.color_vbo = vbo.VBO(color_data)
+        
+        if self.vertex_normals is not None:
+            normal_data = self.vertex_normals.astype(np.float32)
+            self.normal_vbo = vbo.VBO(normal_data)
+        
+        self.index_vbo = vbo.VBO(index_data, target=GL_ELEMENT_ARRAY_BUFFER)
+        self.num_faces = len(self.faces)
+        
+        print(f"Created VBOs for {len(self.vertices):,} vertices, {self.num_faces:,} faces")
+    
+    def delete_vbos(self):
+        """Delete existing VBOs"""
+        if self.vertex_vbo is not None:
+            self.vertex_vbo.delete()
+            self.vertex_vbo = None
+        if self.color_vbo is not None:
+            self.color_vbo.delete()
+            self.color_vbo = None
+        if self.normal_vbo is not None:
+            self.normal_vbo.delete()
+            self.normal_vbo = None
+        if self.index_vbo is not None:
+            self.index_vbo.delete()
+            self.index_vbo = None
+    
+    def process_image(self, image_path):
+        """Process dropped image to 3D"""
+        if self.model is None or self.loading or self.processing:
+            return
+            
+        self.processing = True
+        self.status_message = f"Processing: {Path(image_path).name}"
+        
+        def _process():
+            try:
+                # Load image
+                image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+                height, width = image.shape[:2]
+                
+                # Resize if too large (but keep good quality)
+                max_size = 1280
+                if max(height, width) > max_size:
+                    scale = max_size / max(height, width)
+                    new_width = int(width * scale)
+                    new_height = int(height * scale)
+                    image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                    height, width = new_height, new_width
+                
+                # Convert to tensor
+                image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+                image_tensor = image_tensor.permute(2, 0, 1)
+                
+                # Run inference
+                with torch.no_grad():
+                    output = self.model.infer(image_tensor, use_fp16=(self.device.type == "cuda"))
+                
+                # Extract outputs
+                points = output['points'].cpu().numpy()
+                depth = output['depth'].cpu().numpy()
+                mask = output['mask'].cpu().numpy()
+                normal = output.get('normal')
+                if normal is not None:
+                    normal = normal.cpu().numpy()
+                
+                # Clean mask
+                if self.smooth_edges:
+                    # Apply simple smoothing to depth for cleaner edges
+                    # Use gaussian blur which works well with float32
+                    depth_smooth = cv2.GaussianBlur(depth, (3, 3), 0.5)
+                    mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+                else:
+                    # Standard edge detection without smoothing
+                    mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth, rtol=0.04)
+                
+                # Create mesh
+                if normal is None:
+                    faces, vertices, vertex_colors, _ = utils3d.numpy.image_mesh(
+                        points,
+                        image.astype(np.float32) / 255,
+                        utils3d.numpy.image_uv(width=width, height=height),
+                        mask=mask_cleaned,
+                        tri=True
+                    )
+                    vertex_normals = None
+                else:
+                    faces, vertices, vertex_colors, _, vertex_normals = utils3d.numpy.image_mesh(
+                        points,
+                        image.astype(np.float32) / 255,
+                        utils3d.numpy.image_uv(width=width, height=height),
+                        normal,
+                        mask=mask_cleaned,
+                        tri=True
+                    )
+                
+                # Convert coordinates
+                vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
+                if vertex_normals is not None:
+                    vertex_normals = vertex_normals * np.array([1, -1, -1], dtype=np.float32)
+                
+                # Store mesh data for main thread to process
+                with self.mesh_lock:
+                    self.pending_mesh = {
+                        'vertices': vertices,
+                        'faces': faces,
+                        'vertex_colors': vertex_colors,
+                        'vertex_normals': vertex_normals,
+                        'center': np.mean(vertices, axis=0),
+                        'scale': np.max(np.abs(vertices - np.mean(vertices, axis=0)))
+                    }
+                
+                self.status_message = f"Loaded: {Path(image_path).name} ({len(vertices):,} vertices)"
+                print(f"Mesh created: {len(vertices):,} vertices, {len(faces):,} faces")
+                
+            except Exception as e:
+                self.status_message = f"Error: {str(e)}"
+                print(f"Error processing image: {e}")
+            finally:
+                self.processing = False
+                
+        threading.Thread(target=_process, daemon=True).start()
+    
+    def init_gl(self):
+        """Initialize OpenGL"""
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+        
+        # Enable vertex arrays
+        glEnableClientState(GL_VERTEX_ARRAY)
+        glEnableClientState(GL_COLOR_ARRAY)
+        
+        # Lighting
+        glLightfv(GL_LIGHT0, GL_POSITION, [1, 1, 1, 0])
+        glLightfv(GL_LIGHT0, GL_AMBIENT, [0.3, 0.3, 0.3, 1])
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.7, 0.7, 0.7, 1])
+        
+        # Pure black background
+        glClearColor(0.0, 0.0, 0.0, 1.0)
+        
+        # Enable backface culling for performance
+        glEnable(GL_CULL_FACE)
+        glCullFace(GL_BACK)
+        
+        # Set initial viewport
+        self.update_viewport()
+    
+    def update_viewport(self):
+        """Update OpenGL viewport when window size changes"""
+        # This is now handled in the render method for proper separation of 3D and UI rendering
+        pass
+    
+    def toggle_fullscreen(self):
+        """Toggle between fullscreen and windowed mode"""
+        if self.fullscreen:
+            # Switch to windowed mode
+            self.width, self.height = self.windowed_size
+            screen = pygame.display.set_mode((self.width, self.height), DOUBLEBUF | OPENGL | RESIZABLE)
+            self.fullscreen = False
+        else:
+            # Store current windowed size
+            if not self.fullscreen:
+                self.windowed_size = (self.width, self.height)
+            
+            # Switch to fullscreen mode
+            screen = pygame.display.set_mode((0, 0), DOUBLEBUF | OPENGL | FULLSCREEN)
+            self.width, self.height = screen.get_size()
+            self.fullscreen = True
+        
+        # Update viewport and mouse center
+        self.update_viewport()
+        self.last_mouse_x = self.width // 2
+        self.last_mouse_y = self.height // 2
+        
+        # Update ImGui display size
+        if self.imgui_renderer:
+            io = imgui.get_io()
+            io.display_size = (self.width, self.height)
+        
+        return screen
+    
+    def handle_window_resize(self, new_width, new_height):
+        """Handle window resize events"""
+        self.width = new_width
+        self.height = new_height
+        self.update_viewport()
+        self.last_mouse_x = self.width // 2
+        self.last_mouse_y = self.height // 2
+        
+        # Update ImGui display size
+        if self.imgui_renderer:
+            io = imgui.get_io()
+            io.display_size = (self.width, self.height)
+        
+    def draw_axes(self):
+        """Draw coordinate axes"""
+        glDisable(GL_LIGHTING)
+        glLineWidth(2)
+        
+        glBegin(GL_LINES)
+        # X axis - Red
+        glColor3f(1, 0, 0)
+        glVertex3f(0, 0, 0)
+        glVertex3f(1, 0, 0)
+        # Y axis - Green
+        glColor3f(0, 1, 0)
+        glVertex3f(0, 0, 0)
+        glVertex3f(0, 1, 0)
+        # Z axis - Blue
+        glColor3f(0, 0, 1)
+        glVertex3f(0, 0, 0)
+        glVertex3f(0, 0, 1)
+        glEnd()
+        
+        glEnable(GL_LIGHTING)
+    
+    def draw_mesh(self):
+        """Draw the 3D mesh using VBOs"""
+        if not self.has_mesh or self.vertex_vbo is None:
+            return
+            
+        # Save current OpenGL state
+        glPushAttrib(GL_ALL_ATTRIB_BITS)
+            
+        if self.wireframe:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+            glDisable(GL_LIGHTING)
+        else:
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+            glEnable(GL_LIGHTING)
+        
+        # Enable depth testing for 3D rendering
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LESS)
+        
+        # Bind VBOs and draw
+        try:
+            # Enable client states
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glEnableClientState(GL_COLOR_ARRAY)
+            
+            # Bind vertex VBO
+            self.vertex_vbo.bind()
+            glVertexPointer(3, GL_FLOAT, 0, self.vertex_vbo)
+            
+            # Bind color VBO
+            self.color_vbo.bind()
+            glColorPointer(3, GL_FLOAT, 0, self.color_vbo)
+            
+            # Bind normal VBO if available
+            if self.normal_vbo is not None:
+                glEnableClientState(GL_NORMAL_ARRAY)
+                self.normal_vbo.bind()
+                glNormalPointer(GL_FLOAT, 0, self.normal_vbo)
+            
+            # Bind index VBO and draw
+            self.index_vbo.bind()
+            glDrawElements(GL_TRIANGLES, self.num_faces * 3, GL_UNSIGNED_INT, None)
+            
+            # Unbind VBOs
+            self.index_vbo.unbind()
+            self.vertex_vbo.unbind()
+            self.color_vbo.unbind()
+            if self.normal_vbo is not None:
+                self.normal_vbo.unbind()
+                glDisableClientState(GL_NORMAL_ARRAY)
+            
+            # Disable client states
+            glDisableClientState(GL_VERTEX_ARRAY)
+            glDisableClientState(GL_COLOR_ARRAY)
+                
+        except Exception as e:
+            print(f"Error drawing mesh: {e}")
+        
+        # Restore OpenGL state
+        glPopAttrib()
+    
+    def update_window_title(self):
+        """Update window title with status"""
+        current_model = self.get_current_model_info()
+        title = f"MoGe 3D Viewer - {current_model}"
+        if self.has_mesh:
+            title += f" | {len(self.vertices):,} vertices"
+            if hasattr(self, 'clock'):
+                title += f" | FPS: {int(self.clock.get_fps())}"
+        pygame.display.set_caption(title)
+    
+    def update_camera(self, keys):
+        """Update camera position based on input"""
+        # Calculate right vector
+        camera_right = np.cross(self.camera_front, self.camera_up)
+        camera_right = camera_right / np.linalg.norm(camera_right)
+        
+        # Speed modifier
+        speed = self.camera_speed * 3.0 if keys[K_LSHIFT] or keys[K_RSHIFT] else self.camera_speed
+        
+        # Movement
+        if keys[K_w]:
+            self.camera_pos += speed * self.camera_front
+        if keys[K_s]:
+            self.camera_pos -= speed * self.camera_front
+        if keys[K_a]:
+            self.camera_pos -= speed * camera_right
+        if keys[K_d]:
+            self.camera_pos += speed * camera_right
+        if keys[K_q]:
+            self.camera_pos -= speed * self.camera_up
+        if keys[K_e]:
+            self.camera_pos += speed * self.camera_up
+    
+    def update_camera_rotation(self, dx, dy):
+        """Update camera rotation from mouse movement"""
+        self.yaw += dx * self.mouse_sensitivity
+        self.pitch -= dy * self.mouse_sensitivity
+        
+        # Clamp pitch
+        self.pitch = max(-89.0, min(89.0, self.pitch))
+        
+        # Calculate new front vector
+        front = np.array([
+            np.cos(np.radians(self.yaw)) * np.cos(np.radians(self.pitch)),
+            np.sin(np.radians(self.pitch)),
+            np.sin(np.radians(self.yaw)) * np.cos(np.radians(self.pitch))
+        ])
+        self.camera_front = front / np.linalg.norm(front)
+    
+    def check_pending_mesh(self):
+        """Check for pending mesh updates and apply them on the main thread"""
+        with self.mesh_lock:
+            if self.pending_mesh is not None:
+                # Update mesh data
+                self.vertices = self.pending_mesh['vertices']
+                self.faces = self.pending_mesh['faces']
+                self.vertex_colors = self.pending_mesh['vertex_colors']
+                self.vertex_normals = self.pending_mesh['vertex_normals']
+                self.has_mesh = True
+                
+                # Set mesh info for UI
+                self.mesh_info = f"{len(self.vertices):,} vertices, {len(self.faces):,} faces"
+                
+                # Reset camera if needed (for static images)
+                if self.pending_mesh['center'] is not None:
+                    center = self.pending_mesh['center']
+                    scale = self.pending_mesh['scale']
+                    # Position camera to view the mesh properly
+                    self.camera_pos = center + np.array([0, 0, scale * 3])
+                    # Look towards the mesh center
+                    direction = center - self.camera_pos
+                    self.camera_front = direction / np.linalg.norm(direction)
+                    self.camera_up = np.array([0.0, 1.0, 0.0])
+                    
+                    print(f"Camera positioned at: {self.camera_pos}")
+                    print(f"Looking at mesh center: {center}")
+                    print(f"Mesh scale: {scale}")
+                
+                # Create VBOs on main thread
+                self.create_vbos()
+                
+                # Update viewport in case UI state changed
+                self.update_viewport()
+                
+                # Clear pending mesh
+                self.pending_mesh = None
+    
+    def render_imgui(self):
+        """Render modern Discord-like ImGui UI"""
+        if self.imgui_renderer is None:
+            return
+        
+        # Process events for ImGui
+        self.imgui_renderer.process_inputs()
+        
+        # Remove thumbnail processing since we're not using thumbnails anymore
+        # if self.show_window_selector_dialog:
+        #     self.process_thumbnail_textures()
+            
+        imgui.new_frame()
+        
+        # Custom Discord-like dark theme
+        self.apply_discord_theme()
+        
+        # Main UI Components
+        if self.show_main_ui:
+            self.render_sidebar()
+            self.render_sidebar_toggle_button()  # Show toggle when sidebar hidden
+            if self.show_video_controls:
+                self.render_video_controls()
+        
+        # Dialogs
+        if self.show_window_selector_dialog:
+            self.render_window_selector()
+        
+        if self.show_settings_panel:
+            self.render_settings_panel()
+        
+        imgui.render()
+        self.imgui_renderer.render(imgui.get_draw_data())
+    
+    def apply_discord_theme(self):
+        """Apply pure black dark theme"""
+        style = imgui.get_style()
+        
+        # Colors - Pure Black Theme
+        colors = {
+            imgui.COLOR_TEXT: (0.85, 0.87, 0.91, 1.00),
+            imgui.COLOR_TEXT_DISABLED: (0.42, 0.44, 0.47, 1.00),
+            imgui.COLOR_WINDOW_BACKGROUND: (0.0, 0.0, 0.0, 1.00),
+            imgui.COLOR_CHILD_BACKGROUND: (0.0, 0.0, 0.0, 1.00),
+            imgui.COLOR_POPUP_BACKGROUND: (0.0, 0.0, 0.0, 0.98),
+            imgui.COLOR_BORDER: (0.2, 0.2, 0.2, 0.30),
+            imgui.COLOR_BORDER_SHADOW: (0.00, 0.00, 0.00, 0.00),
+            imgui.COLOR_FRAME_BACKGROUND: (0.1, 0.1, 0.1, 1.00),
+            imgui.COLOR_FRAME_BACKGROUND_HOVERED: (0.15, 0.15, 0.15, 1.00),
+            imgui.COLOR_FRAME_BACKGROUND_ACTIVE: (0.2, 0.2, 0.2, 1.00),
+            imgui.COLOR_TITLE_BACKGROUND: (0.0, 0.0, 0.0, 1.00),
+            imgui.COLOR_TITLE_BACKGROUND_ACTIVE: (0.0, 0.0, 0.0, 1.00),
+            imgui.COLOR_TITLE_BACKGROUND_COLLAPSED: (0.0, 0.0, 0.0, 0.75),
+            imgui.COLOR_MENUBAR_BACKGROUND: (0.0, 0.0, 0.0, 1.00),
+            imgui.COLOR_SCROLLBAR_BACKGROUND: (0.0, 0.0, 0.0, 0.00),
+            imgui.COLOR_SCROLLBAR_GRAB: (0.2, 0.2, 0.2, 1.00),
+            imgui.COLOR_SCROLLBAR_GRAB_HOVERED: (0.3, 0.3, 0.3, 1.00),
+            imgui.COLOR_SCROLLBAR_GRAB_ACTIVE: (0.4, 0.4, 0.4, 1.00),
+            imgui.COLOR_CHECK_MARK: (0.45, 0.55, 0.95, 1.00),
+            imgui.COLOR_SLIDER_GRAB: (0.45, 0.55, 0.95, 1.00),
+            imgui.COLOR_SLIDER_GRAB_ACTIVE: (0.55, 0.65, 1.00, 1.00),
+            imgui.COLOR_BUTTON: (0.1, 0.1, 0.1, 1.00),
+            imgui.COLOR_BUTTON_HOVERED: (0.2, 0.2, 0.2, 1.00),
+            imgui.COLOR_BUTTON_ACTIVE: (0.3, 0.3, 0.3, 1.00),
+            imgui.COLOR_HEADER: (0.1, 0.1, 0.1, 1.00),
+            imgui.COLOR_HEADER_HOVERED: (0.2, 0.2, 0.2, 1.00),
+            imgui.COLOR_HEADER_ACTIVE: (0.45, 0.55, 0.95, 1.00),
+            imgui.COLOR_SEPARATOR: (0.2, 0.2, 0.2, 1.00),
+            imgui.COLOR_SEPARATOR_HOVERED: (0.45, 0.55, 0.95, 0.78),
+            imgui.COLOR_SEPARATOR_ACTIVE: (0.45, 0.55, 0.95, 1.00),
+            imgui.COLOR_RESIZE_GRIP: (0.26, 0.59, 0.98, 0.25),
+            imgui.COLOR_RESIZE_GRIP_HOVERED: (0.26, 0.59, 0.98, 0.67),
+            imgui.COLOR_RESIZE_GRIP_ACTIVE: (0.26, 0.59, 0.98, 0.95),
+        }
+        
+        for color_id, color in colors.items():
+            style.colors[color_id] = color
+        
+        # Style adjustments - more compact
+        style.window_rounding = 6.0
+        style.child_rounding = 4.0
+        style.frame_rounding = 3.0
+        style.popup_rounding = 6.0
+        style.scrollbar_rounding = 9.0
+        style.grab_rounding = 3.0
+        style.tab_rounding = 4.0
+        
+        style.window_border_size = 0.0
+        style.child_border_size = 1.0
+        style.popup_border_size = 1.0
+        style.frame_border_size = 0.0
+        
+        style.window_padding = (8.0, 8.0)
+        style.frame_padding = (4.0, 3.0)
+        style.item_spacing = (6.0, 4.0)
+        style.item_inner_spacing = (6.0, 4.0)
+        style.indent_spacing = 15.0
+        style.scrollbar_size = 12.0
+        style.grab_min_size = 10.0
+    
+    def update_sidebar_animation(self, delta_time):
+        """Update sidebar animation"""
+        # Set target based on visibility
+        target = 1.0 if self.show_sidebar else 0.0
+        self.sidebar_animation_target = target
+        
+        # Smoothly animate to target with proper easing
+        if abs(self.sidebar_animation_current - self.sidebar_animation_target) > 0.001:
+            diff = self.sidebar_animation_target - self.sidebar_animation_current
+            # Use actual delta time for smooth animation
+            animation_speed = 10.0  # Increased from 8.0 for snappier response
+            self.sidebar_animation_current += diff * animation_speed * delta_time
+            
+            # Clamp to valid range
+            self.sidebar_animation_current = max(0.0, min(1.0, self.sidebar_animation_current))
+            
+            # Clamp to target when very close
+            if abs(self.sidebar_animation_current - self.sidebar_animation_target) < 0.001:
+                self.sidebar_animation_current = self.sidebar_animation_target
+        else:
+            self.sidebar_animation_current = self.sidebar_animation_target
+    
+    def get_animated_sidebar_width(self):
+        """Get current animated sidebar width including margin for viewport calculations"""
+        # Include margin for viewport offset calculations
+        base_width = int(self.sidebar_width * self.sidebar_animation_current)
+        return base_width + 10 if base_width > 0 else 0  # Add 10px margin when sidebar is visible
+    
+    def render_sidebar(self):
+        """Render animated sidebar with better styling and margins"""
+        # Get actual frame time for smooth animation
+        frame_time = self.clock.get_time() / 1000.0 if hasattr(self, 'clock') else 1.0/60.0
+        self.update_sidebar_animation(frame_time)
+        
+        current_width = self.get_animated_sidebar_width()
+        
+        # Don't render if completely closed
+        if current_width < 5:
+            return
+            
+        # Position sidebar with margin
+        sidebar_margin = 10
+        imgui.set_next_window_position(sidebar_margin, 0)
+        imgui.set_next_window_size(current_width, self.height)
+        
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | 
+                imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE | imgui.WINDOW_NO_SCROLLBAR)
+        
+        imgui.push_style_var(imgui.STYLE_WINDOW_PADDING, (0, 0))
+        imgui.begin("##sidebar", False, flags)
+        imgui.pop_style_var()
+        
+        # Header with better styled toggle button
+        imgui.push_style_color(imgui.COLOR_CHILD_BACKGROUND, 0.05, 0.05, 0.05, 1.0)
+        imgui.begin_child("header", 0, 60, border=False)
+        
+        # Logo and title with proper margin
+        imgui.set_cursor_pos((20, 18))  # Reduced from 30px
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.9, 0.9, 0.9, 1.0)
+        imgui.text("MoGe 3D")
+        imgui.pop_style_color()
+        
+        # Modern hamburger/close toggle button
+        imgui.same_line()
+        if current_width > 100:  # Only show if sidebar is reasonably wide
+            # Position close button properly from right edge
+            imgui.set_cursor_pos_x(current_width - 45)  # 45px from right edge of sidebar
+            imgui.set_cursor_pos_y(15)
+            
+            # Custom styled button
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.15, 0.15, 0.15, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.25, 0.25, 0.25, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, 0.35, 0.35, 0.35, 1.0)
+            imgui.push_style_var(imgui.STYLE_FRAME_ROUNDING, 4.0)
+            
+            # Use cleaner icon
+            if imgui.button("×", 30, 30):
+                self.show_sidebar = False
+                
+            imgui.pop_style_var()
+            imgui.pop_style_color(3)
+        
+        imgui.set_cursor_pos((20, 38))  # Subtitle with margin
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+        imgui.text("Real-time Viewer")
+        imgui.pop_style_color()
+        
+        imgui.end_child()
+        imgui.pop_style_color()
+        
+        # Main content area with proper margins on both sides
+        imgui.push_style_var(imgui.STYLE_WINDOW_PADDING, (15, 15))  # Reduced padding
+        imgui.begin_child("sidebar_content", 0, 0, border=False)
+        
+        # Only render content if sidebar is reasonably open
+        if current_width > 50:
+            # Calculate content width for buttons - simple calculation
+            content_width = max(50, current_width - 30)  # 15px padding on each side
+            
+            # Regular sections with better spacing
+            self.render_model_section(content_width)
+                
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+                
+            self.render_input_sources(content_width)
+            
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+            
+            self.render_display_options(content_width)
+            
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+            
+            self.render_mesh_status(content_width)
+            
+            imgui.spacing()
+            imgui.separator()
+            imgui.spacing()
+            
+            self.render_camera_controls(content_width)
+        
+        imgui.end_child()
+        imgui.pop_style_var()
+        
+        imgui.end()
+    
+    def render_sidebar_toggle_button(self):
+        """Render modern floating toggle button when sidebar is hidden"""
+        # Don't show toggle button if sidebar is visible or still animating
+        if self.show_sidebar or self.sidebar_animation_current > 0.05:
+            return
+            
+        # Modern floating toggle button
+        imgui.set_next_window_position(15, 15)
+        imgui.set_next_window_size(50, 50)
+        
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | 
+                imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE | 
+                imgui.WINDOW_NO_BACKGROUND | imgui.WINDOW_NO_SCROLLBAR)
+        
+        imgui.begin("##sidebar_toggle", False, flags)
+        
+        # Modern styled button
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.1, 0.1, 0.1, 0.9)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.2, 0.2, 0.2, 0.9)
+        imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, 0.3, 0.3, 0.3, 0.9)
+        imgui.push_style_var(imgui.STYLE_FRAME_ROUNDING, 8.0)
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (8, 8))
+        
+        # Hamburger menu icon (three lines)
+        if imgui.button("☰", 35, 35):
+            self.show_sidebar = True
+            
+        imgui.pop_style_var(2)
+        imgui.pop_style_color(3)
+            
+        imgui.end()
+    
+    def render_collapsible_sections(self):
+        """Deprecated - using regular sections now"""
+        pass
+    
+    def render_model_section(self, content_width):
+        """Render model selection section"""
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
+        imgui.text("MODEL")
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Current model info
+        version, model_name, description = self.available_models[self.current_model_index]
+        
+        # Model selector dropdown style
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (5, 4))
+        imgui.push_style_color(imgui.COLOR_FRAME_BACKGROUND, 0.15, 0.16, 0.17, 1.0)
+        
+        # Shorten the description for display
+        display_desc = description.split(' - ')[1] if ' - ' in description else description
+        
+        # Use content width directly, no max() to prevent overflow
+        button_width = content_width
+        imgui.push_item_width(button_width)
+        if imgui.begin_combo("##model_select", display_desc):
+            for i, (v, name, desc) in enumerate(self.available_models):
+                is_selected = (i == self.current_model_index)
+                display_item = desc.split(' - ')[1] if ' - ' in desc else desc
+                if imgui.selectable(display_item, is_selected)[0]:
+                    if i != self.current_model_index:
+                        self.current_model_index = i
+                        # Switch model
+                        self.switch_model(0)  # 0 means switch to current_model_index
+                if is_selected:
+                    imgui.set_item_default_focus()
+            imgui.end_combo()
+        imgui.pop_item_width()
+        
+        imgui.pop_style_color()
+        imgui.pop_style_var()
+        
+        imgui.spacing()
+        
+        # Model status
+        if self.loading:
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.9, 0.7, 0.3, 1.0)
+            imgui.text("Loading...")
+            imgui.pop_style_color()
+        elif self.model is not None:
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.3, 0.9, 0.5, 1.0)
+            imgui.text("Ready")
+            imgui.pop_style_color()
+    
+    def render_input_sources(self, content_width):
+        """Render input source buttons"""
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
+        imgui.text("INPUT SOURCES")
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Use content width directly for responsive buttons
+        button_width = content_width
+        button_height = 28
+        
+        # Camera button
+        camera_active_color = (0.45, 0.55, 0.95, 1.0) if self.camera_active else (0.20, 0.21, 0.22, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON, *camera_active_color[:3], camera_active_color[3])
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 5))
+        
+        if imgui.button("Camera", button_width, button_height):
+            if self.camera_active:
+                self.stop_camera()
+            else:
+                self.start_camera()
+        
+        imgui.pop_style_var()
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Screen capture button
+        screen_active_color = (0.45, 0.55, 0.95, 1.0) if self.screen_active else (0.20, 0.21, 0.22, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON, *screen_active_color[:3], screen_active_color[3])
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 5))
+        
+        if imgui.button("Screen Capture", button_width, button_height):
+            if self.screen_active:
+                self.stop_screen()
+            else:
+                self.start_screen()
+        
+        imgui.pop_style_var()
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Browse Files button
+        imgui.push_style_color(imgui.COLOR_BUTTON, 0.20, 0.21, 0.22, 1.0)
+        imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.25, 0.26, 0.27, 1.0)
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 5))
+        
+        if imgui.button("Browse Files...", button_width, button_height):
+            self.open_file_dialog()
+        
+        imgui.pop_style_var()
+        imgui.pop_style_color(2)
+    
+    def render_display_options(self, content_width):
+        """Render display options"""
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
+        imgui.text("DISPLAY OPTIONS")
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Checkboxes with custom styling
+        changed, self.wireframe = imgui.checkbox("Wireframe Mode", self.wireframe)
+        changed, self.show_axes = imgui.checkbox("Show Axes", self.show_axes)
+        changed, self.smooth_edges = imgui.checkbox("Edge Smoothing", self.smooth_edges)
+        
+        imgui.spacing()
+        
+        # Settings button - use content width directly
+        button_width = content_width
+        if imgui.button("Advanced Settings", button_width):
+            self.show_settings_panel = not self.show_settings_panel
+    
+    def render_mesh_status(self, content_width):
+        """Render mesh status information"""
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
+        imgui.text("MESH STATUS")
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        if self.has_mesh:
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.3, 0.9, 0.5, 1.0)
+            imgui.text("3D Mesh Loaded")
+            imgui.pop_style_color()
+            
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+            imgui.text(f"{len(self.vertices):,} vertices")
+            imgui.text(f"{len(self.faces):,} faces")
+            if self.vertex_normals is not None:
+                imgui.text("Has normals")
+            imgui.pop_style_color()
+        else:
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+            imgui.text("No mesh loaded")
+            imgui.pop_style_color()
+    
+    def render_camera_controls(self, content_width):
+        """Render camera control info"""
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
+        imgui.text("CAMERA CONTROLS")
+        imgui.pop_style_color()
+        
+        imgui.spacing()
+        
+        # Control hints
+        controls = [
+            ("WASD", "Move"),
+            ("QE", "Up/Down"),
+            ("L-Drag", "Look"),
+            ("R-Drag", "Pan"),
+            ("Wheel", "Forward/Back"),
+            ("Shift", "Faster"),
+            ("Tab", "Toggle UI"),
+        ]
+        
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.5, 0.5, 0.5, 1.0)
+        for key, action in controls:
+            imgui.text(f"{key}: {action}")
+        imgui.pop_style_color()
+    
+    def render_video_controls(self):
+        """Render video player controls"""
+        if not self.video_active:
+            return
+        
+        # Video controls at bottom
+        control_height = self.bottom_panel_height
+        control_x = self.get_animated_sidebar_width() if self.show_main_ui else 0
+        control_width = self.width - control_x
+        
+        # Don't render if width is too small
+        if control_width < 200:
+            return
+            
+        imgui.set_next_window_position(control_x, self.height - control_height)
+        imgui.set_next_window_size(control_width, control_height)
+        
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | 
+                imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE)
+        
+        imgui.push_style_color(imgui.COLOR_WINDOW_BACKGROUND, 0.0, 0.0, 0.0, 0.95)
+        imgui.begin("##video_controls", False, flags)
+        
+        # Get current playback position with thread safety
+        with self.video_lock:
+            current_frame = self.video_current_frame
+            is_playing = self.video_playing
+            is_seeking = self.video_is_seeking
+        
+        # Calculate times
+        current_time = current_frame / self.video_fps
+        total_time = self.video_total_frames / self.video_fps
+        
+        # Disable controls while seeking
+        if is_seeking:
+            imgui.push_style_var(imgui.STYLE_ALPHA, imgui.get_style().alpha * 0.5)
+        
+        # Rewind button
+        imgui.set_cursor_pos((10, 10))
+        if imgui.button("RW", 30, 25):  # Rewind 10s - using text instead of Unicode
+            skip_frames = int(10 * self.video_fps)
+            self.seek_video(max(0, current_frame - skip_frames))
+        
+        # Play/Pause button
+        imgui.same_line()
+        play_text = "||" if is_playing else ">"  # Using ASCII instead of Unicode
+        if imgui.button(play_text, 30, 25):
+            self.toggle_video_playback()
+        
+        # Forward button
+        imgui.same_line()
+        if imgui.button("FF", 30, 25):  # Forward 10s - using text
+            skip_frames = int(10 * self.video_fps)
+            self.seek_video(min(self.video_total_frames - 1, current_frame + skip_frames))
+        
+        # Stop button
+        imgui.same_line()
+        if imgui.button("[]", 30, 25):  # Stop - using ASCII
+            self.stop_video()
+        
+        # Time display
+        imgui.same_line()
+        imgui.set_cursor_pos_x(160)
+        imgui.set_cursor_pos_y(15)
+        current_min = int(current_time // 60)
+        current_sec = int(current_time % 60)
+        total_min = int(total_time // 60)
+        total_sec = int(total_time % 60)
+        imgui.text(f"{current_min:02d}:{current_sec:02d} / {total_min:02d}:{total_sec:02d}")
+        
+        # Timeline (time-based) with processed frames visualization
+        imgui.same_line()
+        timeline_x = 280
+        timeline_y = 12
+        imgui.set_cursor_pos_x(timeline_x)
+        imgui.set_cursor_pos_y(timeline_y)
+        
+        # Calculate timeline width based on available space
+        timeline_width = max(100, control_width - 500)
+        
+        # Draw processed frames shading before the slider
+        draw_list = imgui.get_window_draw_list()
+        win_pos = imgui.get_window_position()
+        
+        # Calculate slider bounds
+        slider_x = win_pos[0] + timeline_x
+        slider_y = win_pos[1] + timeline_y
+        slider_height = 20  # Approximate height of slider
+        
+        # Draw background for unprocessed areas first
+        draw_list.add_rect_filled(
+            slider_x, slider_y,
+            slider_x + timeline_width, slider_y + slider_height,
+            imgui.get_color_u32_rgba(0.15, 0.15, 0.15, 1.0)  # Dark gray background
+        )
+        
+        # Draw processed frames as green segments
+        with self.video_lock:
+            if self.processed_frames and self.video_total_frames > 0:
+                # Convert processed frames to ranges for efficient drawing
+                sorted_frames = sorted(self.processed_frames)
+                ranges = []
+                start = sorted_frames[0]
+                end = start
+                
+                for frame in sorted_frames[1:]:
+                    if frame == end + 1:
+                        end = frame
+                    else:
+                        ranges.append((start, end))
+                        start = frame
+                        end = frame
+                ranges.append((start, end))
+                
+                # Draw each range
+                for start_frame, end_frame in ranges:
+                    start_x = slider_x + (start_frame / self.video_total_frames) * timeline_width
+                    end_x = slider_x + ((end_frame + 1) / self.video_total_frames) * timeline_width
+                    
+                    # Draw processed segment in green
+                    draw_list.add_rect_filled(
+                        start_x, slider_y,
+                        end_x, slider_y + slider_height,
+                        imgui.get_color_u32_rgba(0.0, 0.6, 0.0, 0.8)  # Semi-transparent green
+                    )
+        
+        # Draw the slider on top
+        imgui.push_item_width(timeline_width)
+        changed, new_time = imgui.slider_float(
+            "##timeline", 
+            current_time,
+            0.0,
+            total_time,
+            ""  # No format string, we display time separately
+        )
+        if changed:
+            new_frame = int(new_time * self.video_fps)
+            self.seek_video(new_frame)
+        imgui.pop_item_width()
+        
+        # Tooltip on hover
+        if imgui.is_item_hovered():
+            hover_time = imgui.get_io().mouse_pos[0] - slider_x
+            if 0 <= hover_time <= timeline_width:
+                hover_frame = int((hover_time / timeline_width) * self.video_total_frames)
+                with self.video_lock:
+                    if hover_frame in self.processed_frames:
+                        imgui.set_tooltip("Processed: Instant playback")
+                    else:
+                        imgui.set_tooltip("Not processed yet")
+        
+        # Loop toggle
+        imgui.same_line()
+        imgui.set_cursor_pos_x(control_width - 190)
+        changed, self.video_loop = imgui.checkbox("Loop", self.video_loop)
+        
+        # Live mode toggle
+        imgui.same_line()
+        imgui.set_cursor_pos_x(control_width - 110)
+        changed, self.video_live_mode = imgui.checkbox("Live", self.video_live_mode)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Live: Drop frames to match video speed if behind")
+        
+        # Re-enable controls
+        if is_seeking:
+            imgui.pop_style_var()
+        
+        # Cache and buffer info
+        with self.video_lock:
+            buffer_size = len(self.video_frame_buffer)
+            cache_size = len(self.mesh_cache)
+            processed_count = len(self.processed_frames)
+            
+        imgui.set_cursor_pos((10, 45))
+        
+        # Show processing/buffering status
+        if self.video_total_frames > 0:
+            process_percent = (processed_count / self.video_total_frames) * 100
+            
+            # Color code based on processing status
+            if process_percent < 100:
+                imgui.push_style_color(imgui.COLOR_TEXT, 0.9, 0.7, 0.1, 1.0)  # Yellow for processing
+                imgui.text(f"Processing: {process_percent:.1f}%")
+                imgui.same_line()
+                imgui.pop_style_color()
+            else:
+                imgui.push_style_color(imgui.COLOR_TEXT, 0.1, 0.9, 0.1, 1.0)  # Green for complete
+                imgui.text("Fully processed!")
+                imgui.same_line()
+                imgui.pop_style_color()
+        
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.5, 0.5, 0.5, 1.0)
+        
+        # Show video name and cache info
+        video_name = Path(self.video_path).name if self.video_path else "Unknown"
+        # Truncate long names based on available width
+        max_name_width = max(15, (control_width - 450) // 8)  # Adjusted for more info
+        if len(video_name) > max_name_width:
+            video_name = video_name[:max_name_width-3] + "..."
+        imgui.text(f"{video_name} | Cache: {cache_size} | FPS: {self.video_fps:.1f}")
+        imgui.pop_style_color()
+        
+        imgui.pop_style_color()
+        imgui.end()
+    
+    def render_window_selector(self):
+        """Render Discord-like window selector"""
+        # Get windows and create thumbnails on first render
+        if not hasattr(self, '_window_list_cached'):
+            self._window_list_cached = self.get_window_list()
+            # Start capturing thumbnails in background
+            self.capture_and_create_thumbnails(self._window_list_cached)
+        
+        # Process any captured thumbnails on main thread
+        self.process_captured_thumbnails()
+        
+        windows = self._window_list_cached
+        
+        # Modal overlay
+        imgui.set_next_window_position(0, 0)
+        imgui.set_next_window_size(self.width, self.height)
+        
+        flags = (imgui.WINDOW_NO_TITLE_BAR | imgui.WINDOW_NO_RESIZE | 
+                imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE)
+        
+        imgui.push_style_color(imgui.COLOR_WINDOW_BACKGROUND, 0.0, 0.0, 0.0, 0.8)
+        imgui.begin("##overlay", False, flags)
+        
+        # Center the selector - make it responsive and larger
+        selector_width = min(900, self.width - 100)  # Increased from 600
+        selector_height = min(600, self.height - 100)  # Increased from 400
+        imgui.set_cursor_pos(
+            ((self.width - selector_width) // 2,
+             (self.height - selector_height) // 2)
+        )
+        
+        # Selector window
+        imgui.push_style_color(imgui.COLOR_CHILD_BACKGROUND, 0.05, 0.05, 0.05, 1.0)
+        imgui.push_style_var(imgui.STYLE_CHILD_ROUNDING, 8.0)
+        imgui.begin_child("window_selector", selector_width, selector_height, border=True)
+        
+        # Header
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (20, 20))
+        imgui.set_window_font_scale(1.5)  # Make header text 50% larger
+        imgui.text("Select a window to share")
+        imgui.set_window_font_scale(1.0)  # Reset font scale
+        imgui.pop_style_var()
+        
+        imgui.same_line()
+        imgui.set_cursor_pos_x(selector_width - 50)
+        if imgui.button("X", 35, 35):  # Larger close button
+            self.show_window_selector_dialog = False
+            self.cleanup_thumbnail_textures()
+            self._window_list_cached = None
+                        
+        imgui.separator()
+        
+        # Window grid
+        imgui.begin_child("window_grid", 0, -50, border=False)
+        
+        # Calculate grid layout with larger items
+        item_width = 200  # Increased from 140
+        item_height = 150  # Increased from 100
+        padding = 20  # Increased from 15
+        items_per_row = max(1, (selector_width - 40) // (item_width + padding))
+        
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 0))
+        
+        for i, window in enumerate(windows):
+            # Position in grid
+            col = i % items_per_row
+            row = i // items_per_row
+            
+            x = 20 + col * (item_width + padding)
+            y = row * (item_height + padding)
+            
+            imgui.set_cursor_pos((x, y))
+            
+            # Window item button
+            is_fullscreen = window['id'] is None
+            
+            # Background color based on type
+            if is_fullscreen:
+                imgui.push_style_color(imgui.COLOR_BUTTON, 0.1, 0.3, 0.1, 1.0)
+                imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.15, 0.4, 0.15, 1.0)
+            else:
+                imgui.push_style_color(imgui.COLOR_BUTTON, 0.18, 0.19, 0.20, 1.0)
+                imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.25, 0.26, 0.27, 1.0)
+            
+            if imgui.button(f"##window_{i}", item_width, item_height):
+                self.window_selector_result = window
+                self.show_window_selector_dialog = False
+                self.selected_window = window
+                self.screen_active = True
+                self.status_message = f"Capturing: {window['title']}"
+                self.screen_thread = threading.Thread(target=self._capture_screen, daemon=True)
+                self.screen_thread.start()
+                self.cleanup_thumbnail_textures()
+                self._window_list_cached = None
+            
+            # Get button position for overlay content
+            btn_min = imgui.get_item_rect_min()
+            btn_max = imgui.get_item_rect_max()
+            
+            # Thumbnail area
+            thumb_padding = 10  # Slightly increased
+            thumb_x = btn_min[0] + thumb_padding
+            thumb_y = btn_min[1] + thumb_padding
+            thumb_width = (btn_max[0] - btn_min[0]) - (thumb_padding * 2)
+            thumb_height = 100  # Increased from 62 to better fill the space
+            
+            # Check if we have a texture for this window
+            window_id = window['id']
+            draw_list = imgui.get_window_draw_list()
+            
+            if window_id in self.thumbnail_textures:
+                # Display the pre-created texture
+                texture_id = self.thumbnail_textures[window_id]
+                # Set cursor position relative to the window, not the button
+                imgui.set_cursor_pos((x + thumb_padding, y + thumb_padding))
+                imgui.image(texture_id, thumb_width, thumb_height)
+            else:
+                # No thumbnail - draw placeholder
+                self.draw_thumbnail_placeholder(draw_list, thumb_x, thumb_y, thumb_width, thumb_height, is_fullscreen, window)
+            
+            # Title - display below thumbnail
+            imgui.set_cursor_pos((x + 10, y + 120))  # Adjusted position for larger thumbnail
+            title = window['title'][:25] + "..." if len(window['title']) > 25 else window['title']  # Show more characters
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.9, 0.9, 0.9, 1.0)  # Brighter text
+            imgui.text(title)
+            imgui.pop_style_color()
+                    
+            imgui.pop_style_color(2)
+        
+        imgui.pop_style_var()
+        imgui.end_child()
+        
+        # Bottom bar
+        imgui.separator()
+        imgui.spacing()
+        
+        imgui.set_cursor_pos_x(selector_width - 100)  # Adjusted for larger button
+        imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (15, 8))  # Larger padding for button
+        if imgui.button("Cancel", 80, 35):  # Larger button
+            self.show_window_selector_dialog = False
+            self.cleanup_thumbnail_textures()
+            self._window_list_cached = None
+        imgui.pop_style_var()
+                
+        imgui.end_child()
+        imgui.pop_style_var()
+        imgui.pop_style_color()
+        
+        imgui.end()
+        imgui.pop_style_color()
+    
+    def draw_thumbnail_placeholder(self, draw_list, x, y, width, height, is_fullscreen, window):
+        """Draw a placeholder when thumbnail is not available"""
+        # Draw simple background
+        if is_fullscreen:
+            bg_color = imgui.get_color_u32_rgba(0.05, 0.15, 0.05, 1.0)
+        else:
+            bg_color = imgui.get_color_u32_rgba(0.08, 0.08, 0.09, 1.0)
+        
+        draw_list.add_rect_filled(x, y, x + width, y + height, bg_color, 4)
+        
+        # Add window icon in center
+        icon_text = "🖥️" if is_fullscreen else "?"
+        text_size = imgui.calc_text_size(icon_text)
+        icon_x = x + (width - text_size[0]) // 2
+        icon_y = y + (height - text_size[1]) // 2
+        
+        # Draw the icon text at the calculated position
+        draw_list.add_text(icon_x, icon_y, imgui.get_color_u32_rgba(0.7, 0.7, 0.7, 1.0), icon_text)
+    
+    def render_settings_panel(self):
+        """Render advanced settings panel"""
+        panel_width = 350
+        panel_height = 400
+        
+        # Ensure panel fits in window
+        panel_width = min(panel_width, self.width - 50)
+        panel_height = min(panel_height, self.height - 50)
+        
+        imgui.set_next_window_position(
+            (self.width - panel_width) // 2,
+            (self.height - panel_height) // 2
+        )
+        imgui.set_next_window_size(panel_width, panel_height)
+        
+        # Use constraints to prevent window from going off-screen
+        imgui.set_next_window_size_constraints((300, 300), (500, 600))
+        
+        opened = imgui.begin("Advanced Settings", True)[1]
+        if not opened:
+            self.show_settings_panel = False
+        
+        if opened:
+            # Performance settings
+            imgui.text("Performance")
+            imgui.separator()
+            
+            changed, self.min_process_interval = imgui.slider_float(
+                "Process Interval (s)",
+                self.min_process_interval,
+                0.01, 0.5,
+                "%.2f"
+            )
+            
+            changed, self.screen_scale = imgui.slider_float(
+                "Screen Capture Scale",
+                self.screen_scale,
+                0.1, 1.0,
+                "%.1f"
+            )
+            
+            imgui.spacing()
+            
+            # Camera settings
+            imgui.text("Camera")
+            imgui.separator()
+            
+            changed, self.camera_speed = imgui.slider_float(
+                "Camera Speed",
+                self.camera_speed,
+                0.01, 1.0,
+                "%.2f"
+            )
+            
+            changed, self.mouse_sensitivity = imgui.slider_float(
+                "Mouse Sensitivity",
+                self.mouse_sensitivity,
+                0.1, 1.0,
+                "%.2f"
+            )
+            
+            imgui.spacing()
+                
+            # Video settings
+            imgui.text("Video Playback")
+            imgui.separator()
+            
+            # Raw frame buffer size
+            changed, new_buffer_size = imgui.slider_int(
+                "Raw Buffer (frames)",
+                self.video_buffer_size,
+                30, 1200
+            )
+            if changed:
+                self.video_buffer_size = new_buffer_size
+                # Recreate buffer with new size if video is active
+                if self.video_active:
+                    with self.video_lock:
+                        # Preserve existing frames
+                        old_frames = list(self.video_frame_buffer)
+                        self.video_frame_buffer = deque(old_frames, maxlen=new_buffer_size)
+            
+            # Mesh cache size
+            changed, new_cache_size = imgui.slider_int(
+                "3D Cache (frames)",
+                self.max_mesh_cache,
+                300, 3600
+            )
+            if changed:
+                self.max_mesh_cache = new_cache_size
+                # Trim cache if needed
+                if self.video_active:
+                    with self.video_lock:
+                        while len(self.mesh_cache) > self.max_mesh_cache:
+                            self.mesh_cache.popitem(last=False)
+            
+            # Cache info
+            if self.video_active:
+                with self.video_lock:
+                    cache_count = len(self.mesh_cache)
+                    processed_count = len(self.processed_frames)
+                imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+                imgui.text(f"Cached: {cache_count} | Processed: {processed_count}")
+                if self.video_total_frames > 0:
+                    percent = (processed_count / self.video_total_frames) * 100
+                    imgui.text(f"Progress: {percent:.1f}%")
+                imgui.pop_style_color()
+            
+            imgui.spacing()
+            
+            # Keybindings info
+            imgui.text("Keyboard Shortcuts")
+            imgui.separator()
+            
+            shortcuts = [
+                ("F11", "Toggle Fullscreen"),
+                ("ESC", "Exit"),
+                ("Space", "Capture Mouse"),
+                ("C", "Toggle Camera"),
+                ("V", "Toggle Screen Capture"),
+                ("F", "Toggle Wireframe"),
+                ("G", "Toggle Axes"),
+                ("I", "Toggle Edge Smoothing"),
+                ("Left/Right", "Switch Models"),
+            ]
+            
+            imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+            for key, action in shortcuts:
+                imgui.text(f"{key}: {action}")
+            imgui.pop_style_color()
+        
+        # Always call imgui.end() after imgui.begin(), regardless of opened state
+        imgui.end()
+    
+    def render(self):
+        """Main render function"""
+        # Clear the entire screen first
+        glViewport(0, 0, self.width, self.height)
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        
+        # Calculate 3D viewport dimensions (exclude UI areas)
+        animated_sidebar_width = self.get_animated_sidebar_width() if self.show_main_ui else 0
+        viewport_x = animated_sidebar_width
+        viewport_width = self.width - viewport_x
+        viewport_height = self.height
+        if self.video_active and self.show_video_controls and self.show_main_ui:
+            viewport_height -= self.bottom_panel_height
+        
+        # Only render 3D scene if we have a valid viewport
+        if viewport_width > 0 and viewport_height > 0:
+            # Set viewport for 3D rendering
+            glViewport(viewport_x, 0, viewport_width, viewport_height)
+            
+            # Enable 3D rendering states
+            glEnable(GL_DEPTH_TEST)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_LIGHT0)
+            
+            # Set up projection with correct aspect ratio
+            glMatrixMode(GL_PROJECTION)
+            glLoadIdentity()
+            aspect_ratio = viewport_width / viewport_height
+            gluPerspective(60, aspect_ratio, 0.1, 1000.0)
+        
+            # Set up camera
+            glMatrixMode(GL_MODELVIEW)
+            glLoadIdentity()
+        
+            # Look at
+            camera_target = self.camera_pos + self.camera_front
+            gluLookAt(
+                self.camera_pos[0], self.camera_pos[1], self.camera_pos[2],
+                camera_target[0], camera_target[1], camera_target[2],
+                self.camera_up[0], self.camera_up[1], self.camera_up[2]
+            )
+        
+            # Draw 3D scene
+            if self.show_axes:
+                self.draw_axes()
+        
+            if self.has_mesh:
+                self.draw_mesh()
+                # Debug: print camera info when mesh is visible
+                if hasattr(self, '_debug_counter'):
+                    self._debug_counter += 1
+                    if self._debug_counter % 300 == 0:  # Print every 5 seconds at 60fps
+                        print(f"Rendering mesh: {len(self.vertices):,} vertices at camera pos {self.camera_pos}")
+                else:
+                    self._debug_counter = 1
+        
+        # Reset viewport for UI rendering
+        glViewport(0, 0, self.width, self.height)
+        
+        # Disable depth test for UI (2D overlay)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_LIGHTING)
+        
+        # Set up orthographic projection for UI
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, self.width, self.height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        
+        # Render ImGui UI on top
+        self.render_imgui()
+        
+        # Re-enable 3D states for next frame
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LIGHTING)
+    
+    def handle_drop(self, file_path):
+        """Handle dropped file"""
+        file_lower = file_path.lower()
+        if file_lower.endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+            # Stop any active capture mode
+            if self.video_active:
+                self.stop_video()
+            if self.camera_active:
+                self.stop_camera()
+            if self.screen_active:
+                self.stop_screen()
+            self.process_image(file_path)
+        elif file_lower.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv')):
+            self.start_video(file_path)
+        else:
+            self.status_message = "Please drop an image or video file"
+    
+    def run(self):
+        """Main application loop"""
+        pygame.init()
+        screen = pygame.display.set_mode((self.width, self.height), DOUBLEBUF | OPENGL | RESIZABLE)
+        pygame.display.set_caption("MoGe 3D Viewer - Drag & Drop Images or Videos")
+        
+        # Initialize clock early for frame time calculations
+        clock = pygame.time.Clock()
+        self.clock = clock
+        
+        self.init_gl()
+        self.load_model()
+        
+        # Initialize ImGui
+        imgui.create_context()
+        io = imgui.get_io()
+        io.display_size = (self.width, self.height)
+        io.config_flags |= imgui.CONFIG_NAV_ENABLE_KEYBOARD
+        
+        # Initialize renderer
+        self.imgui_renderer = PygameRenderer()
+        
+        running = True
+        
+        while running:
+            # Get keyboard state
+            keys = pygame.key.get_pressed()
+            
+            # Handle events
+            for event in pygame.event.get():
+                # Let ImGui process events first
+                self.imgui_renderer.process_event(event)
+                
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    # Handle window resize
+                    if not self.fullscreen:  # Only handle resize in windowed mode
+                        self.handle_window_resize(event.w, event.h)
+                elif event.type == pygame.KEYDOWN:
+                    # Only process keyboard if ImGui doesn't want it
+                    if not io.want_capture_keyboard:
+                        if event.key == pygame.K_ESCAPE:
+                            running = False
+                        elif event.key == pygame.K_F11:
+                            # Toggle fullscreen
+                            screen = self.toggle_fullscreen()
+                        elif event.key == pygame.K_SPACE:
+                            self.mouse_captured = not self.mouse_captured
+                            pygame.mouse.set_visible(not self.mouse_captured)
+                            if self.mouse_captured:
+                                pygame.mouse.set_pos(self.width // 2, self.height // 2)
+                                self.last_mouse_x = self.width // 2
+                                self.last_mouse_y = self.height // 2
+                        elif event.key == pygame.K_LEFT:
+                            # Switch to previous model
+                            self.switch_model(-1)
+                        elif event.key == pygame.K_RIGHT:
+                            # Switch to next model
+                            self.switch_model(1)
+                        elif event.key == pygame.K_f:
+                            self.wireframe = not self.wireframe
+                        elif event.key == pygame.K_g:
+                            self.show_axes = not self.show_axes
+                        elif event.key == pygame.K_h:
+                            self.show_help = not self.show_help
+                        elif event.key == pygame.K_c:
+                            # Toggle camera mode
+                            if self.camera_active:
+                                self.stop_camera()
+                            else:
+                                # Stop screen/video if active
+                                if self.screen_active:
+                                    self.stop_screen()
+                                if self.video_active:
+                                    self.stop_video()
+                                self.start_camera()
+                        elif event.key == pygame.K_v:
+                            # Toggle screen mode
+                            if self.screen_active:
+                                self.stop_screen()
+                            else:
+                                # Stop camera/video if active
+                                if self.camera_active:
+                                    self.stop_camera()
+                                if self.video_active:
+                                    self.stop_video()
+                                self.start_screen()
+                        elif event.key == pygame.K_i:
+                            # Toggle edge smoothing
+                            self.smooth_edges = not self.smooth_edges
+                            self.status_message = f"Edge smoothing: {'ON' if self.smooth_edges else 'OFF'}"
+                        elif event.key == pygame.K_TAB:
+                            # Toggle sidebar for immersive view
+                            self.show_sidebar = not self.show_sidebar
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    # Only process mouse if ImGui doesn't want it
+                    if not io.want_capture_mouse:
+                        if event.button == 1:  # Left mouse button
+                            self.left_mouse_held = True
+                            pygame.mouse.get_rel()  # Reset relative movement
+                        elif event.button == 3:  # Right mouse button
+                            self.right_mouse_held = True
+                            pygame.mouse.get_rel()  # Reset relative movement
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    if event.button == 1:  # Left mouse button
+                        self.left_mouse_held = False
+                    elif event.button == 3:  # Right mouse button
+                        self.right_mouse_held = False
+                elif event.type == pygame.MOUSEMOTION:
+                    if not io.want_capture_mouse:
+                        # Left-click drag for camera rotation (FPS style)
+                        if self.left_mouse_held:
+                            rel_x, rel_y = pygame.mouse.get_rel()
+                            if rel_x != 0 or rel_y != 0:
+                                self.update_camera_rotation(rel_x, rel_y)
+                        
+                        # Right-click drag for camera panning
+                        elif self.right_mouse_held:
+                            rel_x, rel_y = pygame.mouse.get_rel()
+                            if rel_x != 0 or rel_y != 0:
+                                # Pan perpendicular to view direction
+                                camera_right = np.cross(self.camera_front, self.camera_up)
+                                camera_right = camera_right / np.linalg.norm(camera_right)
+                                
+                                pan_speed = 0.01
+                                # Move right/left
+                                self.camera_pos += camera_right * rel_x * pan_speed
+                                # Move up/down
+                                self.camera_pos += self.camera_up * -rel_y * pan_speed
+                        
+                        # Space key captured mouse for continuous look
+                        elif self.mouse_captured:
+                            mouse_x, mouse_y = event.pos
+                            dx = mouse_x - self.last_mouse_x
+                            dy = mouse_y - self.last_mouse_y
+                            
+                            self.update_camera_rotation(dx, dy)
+                            
+                            # Reset mouse to center
+                            pygame.mouse.set_pos(self.width // 2, self.height // 2)
+                            self.last_mouse_x = self.width // 2
+                            self.last_mouse_y = self.height // 2
+                elif event.type == pygame.MOUSEWHEEL:
+                    if not io.want_capture_mouse:
+                        # Mouse wheel for forward/backward movement
+                        speed = event.y * 0.5
+                        self.camera_pos += speed * self.camera_front
+                elif event.type == pygame.DROPFILE:
+                    self.handle_drop(event.file)
+            
+            # Update camera from keyboard
+            self.update_camera(keys)
+            
+            # Process frames if in camera, screen, or video mode
+            if self.camera_active or self.screen_active or self.video_active:
+                self.process_frame()
+            
+            # Check for pending mesh updates (must be done on main thread)
+            self.check_pending_mesh()
+            
+            # Render
+            self.render()
+            self.update_window_title()
+            pygame.display.flip()
+            clock.tick(60)
+        
+        # Cleanup
+        self.stop_camera()
+        self.stop_screen()
+        self.stop_video()
+        self.delete_vbos()
+        
+        # Clean up thumbnail textures
+        self.cleanup_thumbnail_textures()
+        
+        # Cleanup ImGui
+        if self.imgui_renderer:
+            self.imgui_renderer.shutdown()
+        
+        pygame.quit()
+
+if __name__ == "__main__":
+    viewer = MoGeViewer()
+    viewer.run()

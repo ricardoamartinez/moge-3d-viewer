@@ -1,14 +1,40 @@
+# IMPORTANT: Requires Python 3.11 (not 3.12 or 3.13)
+# Create conda environment: conda create -n moge python=3.11 -y
+# Activate environment: conda activate moge
+# Then install: pip install -r requirements.txt
+
 # The versions are not specified since MoGe should be compatible with most versions of the packages. 
 # If incompatibilities are found, consider upgrading to latest versions or installing the following recommended version of the package.
+
+# Core ML packages
 torch           # >= 2.0.0
 torchvision
-gradio          # ==2.8.13
-click           # ==8.1.7
+numpy
+
+# Computer Vision and Image Processing
 opencv-python   # ==4.10.0.84
+pillow          # ==10.4.0
+
+# Scientific Computing
 scipy           # ==1.14.1
 matplotlib      # ==3.9.2
+
+# 3D Graphics and Geometry
 trimesh         # ==4.5.1
-pillow          # ==10.4.0
+PyOpenGL        # For OpenGL rendering in view_3d.py
+PyOpenGL-accelerate  # For better OpenGL performance
+
+# GUI and Visualization
+pygame          # For window management and input in view_3d.py
+imgui[pygame]   # For GUI window selection
+mss             # For screen capture
+
+# Utilities
+click           # ==8.1.7
 huggingface_hub # ==0.25.2
+gradio          # ==2.8.13
+sympy           # For symbolic math in training utilities
+
+# 3D utilities package
 git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38
 
