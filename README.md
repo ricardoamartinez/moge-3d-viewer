@@ -51,6 +51,8 @@ python view_3d.py
 - **Left-click drag** - Look around (FPS style)
 - **Right-click drag** - Pan camera
 - **Space** - Toggle mouse capture for continuous look
+- **R** - Reset camera to original photo viewpoint
+- **M** - Toggle smooth movement (acceleration/deceleration)
 
 ### Input Sources
 - **C** - Toggle camera streaming mode
@@ -58,7 +60,9 @@ python view_3d.py
 - **Drag & Drop** - Images or video files
 - **Browse Files** - Use the UI button to open file dialog
 
-### Display Options
+### Debug Rendering
+- **N** - Toggle normal shading (flat shading with lighting)
+- **J** - Toggle faceted rendering (filled triangles, no lighting)
 - **F** - Toggle wireframe mode
 - **G** - Toggle coordinate axes
 - **I** - Toggle edge smoothing
@@ -72,7 +76,7 @@ python view_3d.py
 - **Loop/Live toggles** - Available in video controls
 
 ### General
-- **F11** - Toggle fullscreen
+- **F11 / Alt+Enter** - Toggle fullscreen
 - **Escape** - Exit application
 
 ## Usage
@@ -81,7 +85,9 @@ python view_3d.py
 1. Launch the viewer: `python view_3d.py`
 2. Wait for "Model loaded!" message
 3. Drag and drop any image file (jpg, png, etc.) onto the window
-4. Explore the generated 3D scene
+4. **Camera starts at the original photo viewpoint** - you begin where the photographer was
+5. Explore the generated 3D scene with WASD movement
+6. Press **R** anytime to return to the original photo perspective
 
 ### Video Mode
 1. Drag and drop a video file (mp4, avi, mov, etc.)
@@ -118,6 +124,10 @@ Switch between models using Left/Right arrow keys or the UI dropdown.
 - VBO-based OpenGL rendering for high performance
 - Thread-safe mesh updates prevent rendering artifacts
 - Automatic frame dropping maintains consistent performance
+- **Camera starts at photographer's perspective** - positioned at origin looking into scene
+- **Smooth camera acceleration** - Optional physics-based movement with acceleration/deceleration
+- **Normal shading mode** - Flat shading based on face normals with lighting
+- **Faceted rendering** - Same as wireframe but with filled triangles for crisp look
 
 ## System Requirements
 

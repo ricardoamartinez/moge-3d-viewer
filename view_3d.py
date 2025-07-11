@@ -124,15 +124,22 @@ class MoGeViewer:
         self.index_vbo = None
         self.num_faces = 0
         
-        # Camera - Flying FPS style
-        self.camera_pos = np.array([0.0, 0.0, 3.0])  # Start closer to origin
-        self.camera_front = np.array([0.0, 0.0, -1.0])  # Looking towards negative Z
+        # Camera - Flying FPS style starting at photographer's perspective
+        self.camera_pos = np.array([0.0, 0.0, 0.0])  # Start at origin (where photo was taken)
+        self.camera_front = np.array([0.0, 0.0, -1.0])  # Looking into the scene (negative Z)
         self.camera_up = np.array([0.0, 1.0, 0.0])
         self.camera_speed = 0.1
         self.mouse_sensitivity = 0.3  # Increased for better FPS control
         self.yaw = -90.0  # Looking down negative Z axis
         self.pitch = 0.0
         self.camera_fov = 60.0  # Field of view in degrees
+        self.camera_near_clip = 0.001  # Near clipping plane - very close for detailed inspection
+        
+        # Camera acceleration/smoothing
+        self.camera_acceleration = True  # Enable smooth camera movement
+        self.camera_velocity = np.array([0.0, 0.0, 0.0])  # Current velocity vector
+        self.camera_acceleration_rate = 10.0  # How fast to accelerate (higher = more responsive)
+        self.camera_friction = 8.0  # How fast to decelerate (higher = stops faster)
         
         # Window
         self.width = 1400
@@ -151,6 +158,13 @@ class MoGeViewer:
         self.use_vbo = True
         self.show_help = False
         self.smooth_edges = True  # Toggle for edge smoothing
+        
+        # Normal shading options
+        self.use_normal_shading = False  # Toggle for flat/normal-based shading
+        self.normal_shading_strength = 1.0  # Strength of normal shading effect
+        
+        # Faceted rendering (filled triangles with flat shading, no lighting)
+        self.use_faceted_colors = False  # Toggle for faceted rendering
         
         # Status messages
         self.status_message = "Drag and drop an image or video to start"
@@ -1774,7 +1788,7 @@ class MoGeViewer:
             
             float getLinearDepth(vec2 uv) {
                 float depth = texture2D(depthTexture, uv).r;
-                float near = 0.1;
+                float near = 0.001;
                 float far = 1000.0;
                 float z_n = 2.0 * depth - 1.0;
                 float linearDepth = 2.0 * near * far / (far + near - z_n * (far - near));
@@ -2023,6 +2037,43 @@ class MoGeViewer:
         # This is now handled in the render method for proper separation of 3D and UI rendering
         pass
     
+    def handle_screen_size_change(self):
+        """Handle screen size changes during fullscreen toggle or window resize
+        
+        This method ensures all size-dependent resources are properly updated:
+        - Viewport and mouse positioning
+        - ImGui display size 
+        - OpenGL framebuffers (for DOF effects)
+        - Prevents rendering artifacts during transitions
+        """
+        # Update viewport and mouse center
+        self.update_viewport()
+        self.last_mouse_x = self.width // 2
+        self.last_mouse_y = self.height // 2
+        
+        # Update ImGui display size
+        if self.imgui_renderer:
+            io = imgui.get_io()
+            io.display_size = (self.width, self.height)
+        
+        # Recreate framebuffers for DOF effects with new screen size
+        if self.framebuffers_initialized:
+            self.cleanup_framebuffers()
+            self.framebuffers_initialized = False
+            # Reinitialize with new dimensions
+            self.init_framebuffers()
+        
+        # Ensure shaders are reinitialized if they exist (in case screen size affects shader uniforms)
+        if self.shaders_initialized:
+            # Just mark them as needing refresh - they'll be recreated on next render if needed
+            pass
+        
+        # Force OpenGL viewport update
+        glViewport(0, 0, self.width, self.height)
+        
+        print(f"Screen size changed to: {self.width}x{self.height}")
+        print(f"Fullscreen mode: {self.fullscreen}")
+    
     def toggle_fullscreen(self):
         """Toggle between fullscreen and windowed mode"""
         if self.fullscreen:
@@ -2040,15 +2091,8 @@ class MoGeViewer:
             self.width, self.height = screen.get_size()
             self.fullscreen = True
         
-        # Update viewport and mouse center
-        self.update_viewport()
-        self.last_mouse_x = self.width // 2
-        self.last_mouse_y = self.height // 2
-        
-        # Update ImGui display size
-        if self.imgui_renderer:
-            io = imgui.get_io()
-            io.display_size = (self.width, self.height)
+        # Handle screen size change - this updates all size-dependent resources
+        self.handle_screen_size_change()
         
         return screen
     
@@ -2056,20 +2100,11 @@ class MoGeViewer:
         """Handle window resize events"""
         self.width = new_width
         self.height = new_height
-        self.update_viewport()
-        self.last_mouse_x = self.width // 2
-        self.last_mouse_y = self.height // 2
         
-        # Update ImGui display size
-        if self.imgui_renderer:
-            io = imgui.get_io()
-            io.display_size = (self.width, self.height)
-            
-        # Reinitialize framebuffers on resize
-        self.cleanup_framebuffers()
-        self.init_framebuffers()
+        # Use centralized screen size change handler
+        self.handle_screen_size_change()
         
-        # Reinitialize shaders if needed
+        # Reinitialize shaders if needed (specific to resize events)
         if not self.shaders_initialized:
             self.init_shaders()
         
@@ -2106,15 +2141,59 @@ class MoGeViewer:
         if self.wireframe:
             glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
             glDisable(GL_LIGHTING)
+        elif self.use_faceted_colors:
+            # Faceted colors - same as wireframe but with filled triangles
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+            glDisable(GL_LIGHTING)
+            glShadeModel(GL_FLAT)  # Ensure flat shading for crisp triangles
         else:
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-            glEnable(GL_LIGHTING)
+            
+            # Configure lighting based on normal shading mode
+            if self.use_normal_shading:
+                # Flat shading for crisp faceted look
+                glShadeModel(GL_FLAT)
+                glEnable(GL_LIGHTING)
+                glEnable(GL_LIGHT0)
+                
+                # Adjust lighting for better normal visibility
+                ambient = [0.2, 0.2, 0.2, 1.0]
+                diffuse = [0.8 * self.normal_shading_strength, 0.8 * self.normal_shading_strength, 0.8 * self.normal_shading_strength, 1.0]
+                specular = [0.3, 0.3, 0.3, 1.0]
+                
+                glLightfv(GL_LIGHT0, GL_AMBIENT, ambient)
+                glLightfv(GL_LIGHT0, GL_DIFFUSE, diffuse)
+                glLightfv(GL_LIGHT0, GL_SPECULAR, specular)
+                
+                # Disable color material to use normals for shading only
+                glDisable(GL_COLOR_MATERIAL)
+                
+                # Set material properties for better normal visualization
+                mat_ambient = [0.3, 0.3, 0.3, 1.0]
+                mat_diffuse = [0.7, 0.7, 0.7, 1.0]
+                mat_specular = [0.1, 0.1, 0.1, 1.0]
+                mat_shininess = [10.0]
+                
+                glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT, mat_ambient)
+                glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, mat_diffuse)
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, mat_specular)
+                glMaterialfv(GL_FRONT_AND_BACK, GL_SHININESS, mat_shininess)
+            else:
+                # Smooth shading with color material
+                glShadeModel(GL_SMOOTH)
+                glEnable(GL_LIGHTING)
+                glEnable(GL_COLOR_MATERIAL)
+                glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+                
+                # Standard lighting
+                glLightfv(GL_LIGHT0, GL_AMBIENT, [0.3, 0.3, 0.3, 1])
+                glLightfv(GL_LIGHT0, GL_DIFFUSE, [0.7, 0.7, 0.7, 1])
         
         # Enable depth testing for 3D rendering
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LESS)
         
-        # Draw the mesh (regular drawing code)
+        # Draw the mesh using VBOs
         try:
             # Enable client states
             glEnableClientState(GL_VERTEX_ARRAY)
@@ -2175,21 +2254,58 @@ class MoGeViewer:
         camera_right = camera_right / np.linalg.norm(camera_right)
         
         # Speed modifier
-        speed = self.camera_speed * 3.0 if keys[K_LSHIFT] or keys[K_RSHIFT] else self.camera_speed
+        base_speed = self.camera_speed * 3.0 if keys[K_LSHIFT] or keys[K_RSHIFT] else self.camera_speed
         
-        # Movement
-        if keys[K_w]:
-            self.camera_pos += speed * self.camera_front
-        if keys[K_s]:
-            self.camera_pos -= speed * self.camera_front
-        if keys[K_a]:
-            self.camera_pos -= speed * camera_right
-        if keys[K_d]:
-            self.camera_pos += speed * camera_right
-        if keys[K_q]:
-            self.camera_pos -= speed * self.camera_up
-        if keys[K_e]:
-            self.camera_pos += speed * self.camera_up
+        if self.camera_acceleration:
+            # Smooth acceleration-based movement
+            # Calculate desired movement direction
+            desired_velocity = np.array([0.0, 0.0, 0.0])
+            
+            if keys[K_w]:
+                desired_velocity += self.camera_front
+            if keys[K_s]:
+                desired_velocity -= self.camera_front
+            if keys[K_a]:
+                desired_velocity -= camera_right
+            if keys[K_d]:
+                desired_velocity += camera_right
+            if keys[K_q]:
+                desired_velocity -= self.camera_up
+            if keys[K_e]:
+                desired_velocity += self.camera_up
+            
+            # Normalize desired velocity if any movement keys are pressed
+            if np.linalg.norm(desired_velocity) > 0:
+                desired_velocity = desired_velocity / np.linalg.norm(desired_velocity) * base_speed
+            
+            # Apply acceleration towards desired velocity
+            dt = 1.0 / 60.0  # Assume 60 FPS for stable acceleration
+            velocity_diff = desired_velocity - self.camera_velocity
+            
+            if np.linalg.norm(desired_velocity) > 0:
+                # Accelerate towards desired velocity
+                self.camera_velocity += velocity_diff * self.camera_acceleration_rate * dt
+            else:
+                # Apply friction when no keys are pressed
+                self.camera_velocity -= self.camera_velocity * self.camera_friction * dt
+            
+            # Apply velocity to position
+            self.camera_pos += self.camera_velocity
+            
+        else:
+            # Instant movement (original behavior)
+            if keys[K_w]:
+                self.camera_pos += base_speed * self.camera_front
+            if keys[K_s]:
+                self.camera_pos -= base_speed * self.camera_front
+            if keys[K_a]:
+                self.camera_pos -= base_speed * camera_right
+            if keys[K_d]:
+                self.camera_pos += base_speed * camera_right
+            if keys[K_q]:
+                self.camera_pos -= base_speed * self.camera_up
+            if keys[K_e]:
+                self.camera_pos += base_speed * self.camera_up
     
     def update_camera_rotation(self, dx, dy):
         """Update camera rotation from mouse movement"""
@@ -2225,22 +2341,25 @@ class MoGeViewer:
                 if self.pending_mesh['center'] is not None and not self.is_refreshing:
                     center = self.pending_mesh['center']
                     scale = self.pending_mesh['scale']
-                    # Position camera to view the mesh properly
-                    self.camera_pos = center + np.array([0, 0, scale * 3])
-                    # Look towards the mesh center
-                    direction = center - self.camera_pos
-                    self.camera_front = direction / np.linalg.norm(direction)
+                    # Position camera at the original photo viewpoint (photographer's perspective)
+                    # Camera starts at the origin (where the photo was taken) looking into the scene
+                    self.camera_pos = np.array([0.0, 0.0, 0.0])
+                    # Look forward into the scene (negative Z direction in computer vision)
+                    self.camera_front = np.array([0.0, 0.0, -1.0])
                     self.camera_up = np.array([0.0, 1.0, 0.0])
+                    # Reset yaw and pitch to default forward-looking direction
+                    self.yaw = -90.0  # Looking down negative Z axis
+                    self.pitch = 0.0
                     
                     # Auto-set DOF focus distance for natural look
-                    # Focus on the center of the mesh
-                    self.focal_blur_distance = np.linalg.norm(self.camera_pos - center)
-                    self.focal_blur_range = scale * 0.8  # Standard range based on mesh scale
+                    # Focus at a reasonable distance into the scene
+                    self.focal_blur_distance = max(2.0, scale * 2.0)  # Focus into the scene
+                    self.focal_blur_range = scale * 1.5  # Wider range for natural depth
                     
-                    print(f"Camera positioned at: {self.camera_pos}")
-                    print(f"Looking at mesh center: {center}")
-                    print(f"Mesh scale: {scale}")
-                    print(f"Auto DOF focus: {self.focal_blur_distance:.1f}, range: {self.focal_blur_range:.1f}")
+                    print(f"Camera positioned at photographer's viewpoint: {self.camera_pos}")
+                    print(f"Looking into scene: {self.camera_front}")
+                    print(f"Mesh center: {center}, scale: {scale}")
+                    print(f"DOF focus: {self.focal_blur_distance:.1f}, range: {self.focal_blur_range:.1f}")
                 elif self.is_refreshing and self.saved_camera_pos is not None:
                     # Restore saved camera position after refresh
                     self.camera_pos = self.saved_camera_pos
@@ -2477,7 +2596,7 @@ class MoGeViewer:
             imgui.separator()
             imgui.spacing()
             
-            self.render_display_options(content_width)
+            self.render_debug_rendering(content_width)
             
             imgui.spacing()
             imgui.separator()
@@ -2632,11 +2751,19 @@ class MoGeViewer:
         imgui.push_style_color(imgui.COLOR_BUTTON, *camera_active_color[:3], camera_active_color[3])
         imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 5))
         
-        if imgui.button("Camera", button_width, button_height):
-            if self.camera_active:
-                self.stop_camera()
-            else:
-                self.start_camera()
+        # Disable camera button if model not loaded
+        if self.model is None or self.loading:
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.1, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.1, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, 0.1, 0.1, 0.1, 1.0)
+            imgui.button("Camera (Loading...)", button_width, button_height)
+            imgui.pop_style_color(3)
+        else:
+            if imgui.button("Camera", button_width, button_height):
+                if self.camera_active:
+                    self.stop_camera()
+                else:
+                    self.start_camera()
         
         if imgui.is_item_hovered():
             status = "Stop live camera feed" if self.camera_active else "Start live camera feed"
@@ -2652,11 +2779,19 @@ class MoGeViewer:
         imgui.push_style_color(imgui.COLOR_BUTTON, *screen_active_color[:3], screen_active_color[3])
         imgui.push_style_var(imgui.STYLE_FRAME_PADDING, (0, 5))
         
-        if imgui.button("Screen Capture", button_width, button_height):
-            if self.screen_active:
-                self.stop_screen()
-            else:
-                self.start_screen()
+        # Disable screen capture button if model not loaded
+        if self.model is None or self.loading:
+            imgui.push_style_color(imgui.COLOR_BUTTON, 0.1, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_HOVERED, 0.1, 0.1, 0.1, 1.0)
+            imgui.push_style_color(imgui.COLOR_BUTTON_ACTIVE, 0.1, 0.1, 0.1, 1.0)
+            imgui.button("Screen Capture (Loading...)", button_width, button_height)
+            imgui.pop_style_color(3)
+        else:
+            if imgui.button("Screen Capture", button_width, button_height):
+                if self.screen_active:
+                    self.stop_screen()
+                else:
+                    self.start_screen()
         
         if imgui.is_item_hovered():
             status = "Stop screen capture" if self.screen_active else "Start screen capture"
@@ -2681,32 +2816,65 @@ class MoGeViewer:
         imgui.pop_style_var()
         imgui.pop_style_color(2)
     
-    def render_display_options(self, content_width):
-        """Render display options"""
+    def render_debug_rendering(self, content_width):
+        """Render debug rendering options"""
         imgui.push_style_color(imgui.COLOR_TEXT, 0.7, 0.7, 0.7, 1.0)
-        imgui.text("DISPLAY OPTIONS")
+        imgui.text("DEBUG RENDERING")
         imgui.pop_style_color()
         
         imgui.spacing()
         
-        # Checkboxes with custom styling
+        # Normal shading toggle and controls
+        changed, self.use_normal_shading = imgui.checkbox("Normal Shading", self.use_normal_shading)
+        if changed and self.use_normal_shading:
+            # Disable faceted colors when enabling normal shading
+            self.use_faceted_colors = False
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Enable flat shading based on face normals\nGives a crisp, faceted look that highlights polygon structure\nPress 'N' to toggle quickly")
+        
+        if self.use_normal_shading:
+            imgui.indent(20)
+            imgui.push_item_width(content_width - 100)
+            changed, self.normal_shading_strength = imgui.slider_float(
+                "Shading Strength",
+                self.normal_shading_strength,
+                0.1, 2.0, "%.1f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adjust the intensity of normal-based shading\nHigher values = more contrast between faces")
+            imgui.pop_item_width()
+            imgui.unindent(20)
+        
+        imgui.spacing()
+        
+        # Faceted rendering (filled triangles)
+        changed, self.use_faceted_colors = imgui.checkbox("Faceted Rendering", self.use_faceted_colors)
+        if changed and self.use_faceted_colors:
+            # Disable normal shading when enabling faceted rendering
+            self.use_normal_shading = False
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Enable flat shading with filled triangles\nUses same rendering as wireframe but with filled polygons\nNo lighting effects - shows crisp polygon structure\nPress 'J' to toggle quickly")
+        
+        imgui.spacing()
+        
+        # Other debug display options
         changed, self.wireframe = imgui.checkbox("Wireframe Mode", self.wireframe)
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Toggle wireframe rendering mode\nShows the 3D mesh structure as lines instead of solid surfaces")
+            imgui.set_tooltip("Toggle wireframe rendering mode\nShows the 3D mesh structure as lines instead of solid surfaces\nPress 'F' to toggle quickly")
         
         changed, self.show_axes = imgui.checkbox("Show Axes", self.show_axes)
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Display 3D coordinate axes\nRed = X, Green = Y, Blue = Z")
+            imgui.set_tooltip("Display 3D coordinate axes\nRed = X, Green = Y, Blue = Z\nPress 'G' to toggle quickly")
         
         changed, self.smooth_edges = imgui.checkbox("Edge Smoothing", self.smooth_edges)
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Enable anti-aliasing for smoother edges\nImproves visual quality but may reduce performance")
+            imgui.set_tooltip("Enable anti-aliasing for smoother edges\nImproves visual quality but may reduce performance\nPress 'I' to toggle quickly")
         
         imgui.spacing()
         
         # Settings button - use content width directly
         button_width = content_width
-        if imgui.button("Advanced Settings", button_width):
+        if imgui.button("Advanced Settings", button_width, 28):
             self.show_settings_panel = not self.show_settings_panel
         
         if imgui.is_item_hovered():
@@ -2766,6 +2934,64 @@ class MoGeViewer:
         if imgui.is_item_hovered():
             imgui.set_tooltip("Camera field of view angle\nLower = zoomed in, Higher = wide angle")
         
+        # Near clipping plane control
+        changed, self.camera_near_clip = imgui.slider_float(
+            "Near Clipping",
+            self.camera_near_clip,
+            0.0001, 0.1, "%.4f"
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Near clipping plane distance\nSmaller values allow getting closer to objects without clipping\nDefault: 0.001 for extreme close-up capability")
+        
+        # Camera speed control
+        changed, self.camera_speed = imgui.slider_float(
+            "Movement Speed",
+            self.camera_speed,
+            0.01, 1.0,
+            "%.2f"
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("3D camera movement speed\nHigher values = faster movement with WASD keys\nHold Shift to move 3x faster")
+        
+        # Mouse sensitivity control
+        changed, self.mouse_sensitivity = imgui.slider_float(
+            "Mouse Sensitivity",
+            self.mouse_sensitivity,
+            0.1, 1.0,
+            "%.2f"
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Mouse look sensitivity\nHigher values = faster camera rotation when dragging")
+        
+        # Camera acceleration toggle
+        changed, self.camera_acceleration = imgui.checkbox("Smooth Movement", self.camera_acceleration)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Enable smooth camera acceleration\nON: Gradual acceleration and deceleration\nOFF: Instant start/stop movement\nPress 'M' to toggle quickly")
+        
+        # Advanced acceleration controls (only when smooth movement is enabled)
+        if self.camera_acceleration:
+            imgui.indent(20)
+            
+            # Acceleration rate
+            changed, self.camera_acceleration_rate = imgui.slider_float(
+                "Responsiveness",
+                self.camera_acceleration_rate,
+                1.0, 20.0, "%.1f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("How quickly camera accelerates\nHigher = more responsive, snappier movement\nLower = more gradual acceleration")
+            
+            # Friction/deceleration
+            changed, self.camera_friction = imgui.slider_float(
+                "Deceleration",
+                self.camera_friction,
+                1.0, 20.0, "%.1f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("How quickly camera stops\nHigher = stops faster when releasing keys\nLower = longer coasting/gliding")
+            
+            imgui.unindent(20)
+        
         imgui.spacing()
         
         # Depth of Field section
@@ -2789,13 +3015,32 @@ class MoGeViewer:
                 imgui.set_tooltip("Distance to the focal plane from camera\nObjects at this distance will be sharp")
             
             # Auto-focus button
-            if imgui.button("Auto Focus", content_width - 80):
+            button_width = (content_width - 10) // 2  # Properly calculate button width with spacing
+            if imgui.button("Auto Focus", button_width, 25):
                 # Set focus distance to the center of the mesh if visible
                 if self.has_mesh and self.vertices is not None:
                     mesh_center = np.mean(self.vertices, axis=0)
                     self.focal_blur_distance = np.linalg.norm(mesh_center - self.camera_pos)
             if imgui.is_item_hovered():
                 imgui.set_tooltip("Automatically set focus distance to the center of the 3D mesh")
+            
+            # Reset camera button
+            imgui.same_line()
+            imgui.set_cursor_pos_x(imgui.get_cursor_pos_x() + 5)  # Add small spacing
+            if imgui.button("Reset View", button_width, 25):
+                # Reset to photographer's perspective
+                self.camera_pos = np.array([0.0, 0.0, 0.0])
+                self.camera_front = np.array([0.0, 0.0, -1.0])
+                self.camera_up = np.array([0.0, 1.0, 0.0])
+                self.yaw = -90.0
+                self.pitch = 0.0
+                # Reset velocity to prevent movement artifacts
+                self.camera_velocity = np.array([0.0, 0.0, 0.0])
+                if self.has_mesh and self.vertices is not None:
+                    scale = np.max(np.abs(self.vertices - np.mean(self.vertices, axis=0)))
+                    self.focal_blur_distance = max(2.0, scale * 2.0)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Reset camera to original photographer's perspective\nPosition: origin, looking into the scene")
             
             # DOF strength
             changed, self.focal_blur_strength = imgui.slider_float(
@@ -3077,8 +3322,8 @@ class MoGeViewer:
         imgui.set_cursor_pos_x(timeline_x)
         imgui.set_cursor_pos_y(timeline_y)
         
-        # Calculate timeline width based on available space
-        timeline_width = max(100, control_width - 500)
+        # Calculate timeline width based on available space - ensure enough room for controls
+        timeline_width = max(100, control_width - 550)  # Increased margin to prevent overlap
         
         # Draw processed frames shading before the slider
         draw_list = imgui.get_window_draw_list()
@@ -3431,23 +3676,9 @@ class MoGeViewer:
             imgui.text("Camera")
             imgui.separator()
             
-            changed, self.camera_speed = imgui.slider_float(
-                "Camera Speed",
-                self.camera_speed,
-                0.01, 1.0,
-                "%.2f"
-            )
-            if imgui.is_item_hovered():
-                imgui.set_tooltip("3D camera movement speed\nHigher values = faster movement with WASD keys")
+
             
-            changed, self.mouse_sensitivity = imgui.slider_float(
-                "Mouse Sensitivity",
-                self.mouse_sensitivity,
-                0.1, 1.0,
-                "%.2f"
-            )
-            if imgui.is_item_hovered():
-                imgui.set_tooltip("Mouse look sensitivity\nHigher values = faster camera rotation when dragging")
+
             
             imgui.spacing()
                 
@@ -3509,9 +3740,13 @@ class MoGeViewer:
             imgui.separator()
             
             shortcuts = [
-                ("F11", "Toggle Fullscreen"),
+                ("F11 / Alt+Enter", "Toggle Fullscreen"),
                 ("ESC", "Exit"),
                 ("Space", "Capture Mouse"),
+                ("R", "Reset Camera View"),
+                ("M", "Toggle Smooth Movement"),
+                ("N", "Toggle Normal Shading"),
+                ("J", "Toggle Faceted Rendering"),
                 ("C", "Toggle Camera"),
                 ("V", "Toggle Screen Capture"),
                 ("F", "Toggle Wireframe"),
@@ -3538,6 +3773,12 @@ class MoGeViewer:
         if self.video_active and self.show_video_controls and self.show_main_ui:
             viewport_height -= self.bottom_panel_height
         
+        # Safeguard against invalid viewport dimensions during screen transitions
+        if viewport_width <= 0 or viewport_height <= 0:
+            viewport_width = max(1, self.width)
+            viewport_height = max(1, self.height)
+            viewport_x = 0
+        
         # Only render 3D scene if we have a valid viewport
         if viewport_width > 0 and viewport_height > 0 and self.has_mesh:
             # If DOF is enabled and framebuffers are ready, render to framebuffer first
@@ -3559,7 +3800,7 @@ class MoGeViewer:
                 glMatrixMode(GL_PROJECTION)
                 glLoadIdentity()
                 aspect_ratio = viewport_width / float(viewport_height)
-                gluPerspective(self.camera_fov, aspect_ratio, 0.1, 1000.0)
+                gluPerspective(self.camera_fov, aspect_ratio, self.camera_near_clip, 1000.0)
                 
                 # Set up camera
                 glMatrixMode(GL_MODELVIEW)
@@ -3686,7 +3927,7 @@ class MoGeViewer:
                 glMatrixMode(GL_PROJECTION)
                 glLoadIdentity()
                 aspect_ratio = viewport_width / float(viewport_height)
-                gluPerspective(self.camera_fov, aspect_ratio, 0.1, 1000.0)
+                gluPerspective(self.camera_fov, aspect_ratio, self.camera_near_clip, 1000.0)
             
                 # Set up camera
                 glMatrixMode(GL_MODELVIEW)
@@ -3795,6 +4036,9 @@ class MoGeViewer:
                         elif event.key == pygame.K_F11:
                             # Toggle fullscreen
                             screen = self.toggle_fullscreen()
+                        elif event.key == pygame.K_RETURN and (keys[pygame.K_LALT] or keys[pygame.K_RALT]):
+                            # Alt+Enter to toggle fullscreen
+                            screen = self.toggle_fullscreen()
                         elif event.key == pygame.K_SPACE:
                             self.mouse_captured = not self.mouse_captured
                             pygame.mouse.set_visible(not self.mouse_captured)
@@ -3840,6 +4084,42 @@ class MoGeViewer:
                             # Toggle edge smoothing
                             self.smooth_edges = not self.smooth_edges
                             self.status_message = f"Edge smoothing: {'ON' if self.smooth_edges else 'OFF'}"
+                        elif event.key == pygame.K_r:
+                            # Reset camera to photographer's perspective
+                            self.camera_pos = np.array([0.0, 0.0, 0.0])
+                            self.camera_front = np.array([0.0, 0.0, -1.0])
+                            self.camera_up = np.array([0.0, 1.0, 0.0])
+                            self.yaw = -90.0
+                            self.pitch = 0.0
+                            # Reset velocity to prevent movement artifacts
+                            self.camera_velocity = np.array([0.0, 0.0, 0.0])
+                            if self.has_mesh and self.vertices is not None:
+                                scale = np.max(np.abs(self.vertices - np.mean(self.vertices, axis=0)))
+                                self.focal_blur_distance = max(2.0, scale * 2.0)
+                            self.status_message = "Camera reset to photographer's perspective"
+                        elif event.key == pygame.K_m:
+                            # Toggle camera acceleration (smooth movement)
+                            self.camera_acceleration = not self.camera_acceleration
+                            # Reset velocity when toggling to prevent sudden jumps
+                            self.camera_velocity = np.array([0.0, 0.0, 0.0])
+                            mode_text = "smooth" if self.camera_acceleration else "instant"
+                            self.status_message = f"Camera movement: {mode_text}"
+                        elif event.key == pygame.K_n:
+                            # Toggle normal shading
+                            self.use_normal_shading = not self.use_normal_shading
+                            # Disable faceted colors if normal shading is enabled
+                            if self.use_normal_shading:
+                                self.use_faceted_colors = False
+                            mode_text = "ON" if self.use_normal_shading else "OFF"
+                            self.status_message = f"Normal shading: {mode_text}"
+                        elif event.key == pygame.K_j:
+                            # Toggle faceted rendering (filled triangles with flat shading)
+                            self.use_faceted_colors = not self.use_faceted_colors
+                            # Disable normal shading if faceted colors are enabled
+                            if self.use_faceted_colors:
+                                self.use_normal_shading = False
+                            mode_text = "ON" if self.use_faceted_colors else "OFF"
+                            self.status_message = f"Faceted rendering: {mode_text}"
                         elif event.key == pygame.K_TAB:
                             # Toggle sidebar for immersive view
                             self.show_sidebar = not self.show_sidebar
