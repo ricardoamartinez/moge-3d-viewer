@@ -18,6 +18,8 @@ from pygame.locals import *
 from OpenGL.GL import *
 from OpenGL.GLU import *
 from OpenGL.arrays import vbo
+from OpenGL.GL.framebufferobjects import *
+from OpenGL.GL.shaders import compileProgram, compileShader
 import ctypes
 import utils3d
 from pathlib import Path
@@ -66,7 +68,7 @@ class MoGeViewer:
         # Screen capture
         self.screen_thread = None
         self.screen_active = False
-        self.screen_scale = 0.5  # Scale down screen capture for performance
+        self.screen_scale = 1.0  # Use full resolution - let input resolution scale control quality
         self.selected_window = None  # Selected window for capture
         
         # Video playback
@@ -130,6 +132,7 @@ class MoGeViewer:
         self.mouse_sensitivity = 0.3  # Increased for better FPS control
         self.yaw = -90.0  # Looking down negative Z axis
         self.pitch = 0.0
+        self.camera_fov = 60.0  # Field of view in degrees
         
         # Window
         self.width = 1400
@@ -187,8 +190,99 @@ class MoGeViewer:
         self.post_process_hue_shift = 0.0  # -180 to 180 degrees
         self.show_post_process_panel = False  # Toggle for collapsible panel
         
+        # Focal blur settings (for 3D viewer camera)
+        self.enable_focal_blur = True  # Enable by default for AAA look
+        self.focal_blur_distance = 0.1  # Distance in world units
+        self.focal_blur_strength = 0.4  # 0.0 to 1.0 - subtle blur for smooth transitions
+        self.focal_blur_range = 3.5  # Wider focus range for smoother falloff
+        
+        # Framebuffer objects for depth of field
+        self.fbo_scene = None  # Main scene framebuffer
+        self.fbo_blur = None  # Blur pass framebuffer
+        self.scene_texture = None
+        self.depth_texture = None
+        self.blur_texture = None
+        self.framebuffers_initialized = False
+        
+        # Shader programs
+        self.dof_shader = None
+        self.dof_shader_h = None
+        self.dof_shader_v = None
+        self.shaders_initialized = False
+        
         # Input processing settings
         self.input_resolution_scale = 1.0  # 0.1 to 1.0 - scale input before model
+        self.full_resolution_output = True  # If True, upscale output to original resolution
+        
+        # Auto-refresh tracking for static images
+        self.last_processed_image = None  # Path of last processed static image
+        self.last_model_index = self.current_model_index
+        self.last_input_resolution_scale = self.input_resolution_scale
+        self.last_full_resolution_output = self.full_resolution_output
+        self.last_post_processing_enabled = self.enable_post_processing
+        self.last_post_processing_settings = None  # Will store dict of all post-processing values
+        self.is_refreshing = False  # Track if we're auto-refreshing (don't reset camera)
+        self.saved_camera_pos = None  # Save camera position during refresh
+        self.saved_camera_front = None
+        self.saved_camera_up = None
+    
+    def get_current_post_processing_settings(self):
+        """Get current post-processing settings as a dict for comparison"""
+        return {
+            'brightness': self.post_process_brightness,
+            'contrast': self.post_process_contrast,
+            'saturation': self.post_process_saturation,
+            'gamma': self.post_process_gamma,
+            'sharpening': self.post_process_sharpening,
+            'edge_enhance': self.post_process_edge_enhance,
+            'noise_reduction': self.post_process_noise_reduction,
+            'color_temp': self.post_process_color_temp,
+            'hue_shift': self.post_process_hue_shift,
+            'vignette': self.post_process_vignette
+        }
+    
+    def check_if_should_refresh_image(self):
+        """Check if settings changed that require reprocessing the last static image"""
+        if (self.last_processed_image is None or 
+            self.camera_active or self.screen_active or self.video_active or 
+            self.processing or self.loading):
+            return False
+        
+        # Check if key settings changed
+        settings_changed = (
+            self.current_model_index != self.last_model_index or
+            self.input_resolution_scale != self.last_input_resolution_scale or
+            self.full_resolution_output != self.last_full_resolution_output or
+            self.enable_post_processing != self.last_post_processing_enabled
+        )
+        
+        # Check post-processing settings if enabled
+        if self.enable_post_processing and self.last_post_processing_settings is not None:
+            current_settings = self.get_current_post_processing_settings()
+            settings_changed = settings_changed or (current_settings != self.last_post_processing_settings)
+        
+        return settings_changed
+    
+    def update_last_settings(self):
+        """Update the tracked settings after processing"""
+        self.last_model_index = self.current_model_index
+        self.last_input_resolution_scale = self.input_resolution_scale
+        self.last_full_resolution_output = self.full_resolution_output
+        self.last_post_processing_enabled = self.enable_post_processing
+        self.last_post_processing_settings = self.get_current_post_processing_settings()
+    
+    def refresh_last_image(self):
+        """Reprocess the last processed static image with current settings"""
+        if self.last_processed_image and os.path.exists(self.last_processed_image):
+            print(f"Auto-refreshing image with new settings: {Path(self.last_processed_image).name}")
+            
+            # Save current camera position
+            self.saved_camera_pos = self.camera_pos.copy()
+            self.saved_camera_front = self.camera_front.copy()  
+            self.saved_camera_up = self.camera_up.copy()
+            self.is_refreshing = True
+            
+            self.process_image(self.last_processed_image)
     
     def load_model(self, on_complete_callback=None):
         """Load MoGe model in background"""
@@ -309,12 +403,14 @@ class MoGeViewer:
                 return
                 
             # Set camera properties for better performance
-            self.camera_stream.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.camera_stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Use camera's native resolution - let input resolution scale control quality
             self.camera_stream.set(cv2.CAP_PROP_FPS, 30)
             
             self.camera_active = True
             self.status_message = "Camera mode active"
+            
+            # Clear last processed image since we're now in real-time mode
+            self.last_processed_image = None
             
             # Start capture thread
             self.camera_thread = threading.Thread(target=self._capture_frames, daemon=True)
@@ -631,6 +727,9 @@ class MoGeViewer:
             self.video_processing_active = True
             self.show_video_controls = True
             
+            # Clear last processed image since we're now in video mode
+            self.last_processed_image = None
+            
             # Calculate video duration
             total_seconds = self.video_total_frames / self.video_fps
             minutes = int(total_seconds // 60)
@@ -789,14 +888,24 @@ class MoGeViewer:
                 
                 try:
                     # Convert BGR to RGB
-                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    height, width = image.shape[:2]
+                    original_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    original_height, original_width = original_image.shape[:2]
                     
-                    # Apply post-processing
-                    image = self.apply_post_processing(image)
+                    # Prepare image for model processing
+                    if self.input_resolution_scale != 1.0:
+                        # Scale down for model input
+                        model_width = int(original_width * self.input_resolution_scale)
+                        model_height = int(original_height * self.input_resolution_scale)
+                        model_image = cv2.resize(original_image, (model_width, model_height), interpolation=cv2.INTER_AREA)
+                    else:
+                        model_image = original_image.copy()
+                        model_width, model_height = original_width, original_height
+                    
+                    # Apply post-processing to model input
+                    model_image = self.apply_post_processing(model_image)
                     
                     # Convert to tensor
-                    image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+                    image_tensor = torch.tensor(model_image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
                     image_tensor = image_tensor.permute(2, 0, 1)
                     
                     # Run inference
@@ -811,32 +920,74 @@ class MoGeViewer:
                     if normal is not None:
                         normal = normal.cpu().numpy()
                     
+                    # Mesh geometry always uses model resolution (controlled by input_resolution_scale)
+                    final_points = points
+                    final_depth = depth
+                    final_mask = mask
+                    final_normal = normal
+                    final_width, final_height = model_width, model_height
+                    
+                    # Texture resolution depends on full_resolution_output setting
+                    if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                        # Use original high-resolution image for texture sampling
+                        texture_image = self.apply_post_processing(original_image)
+                        texture_width, texture_height = original_width, original_height
+                    else:
+                        # Use model resolution image for texture
+                        texture_image = model_image
+                        texture_width, texture_height = model_width, model_height
+                    
                     # Clean mask
                     if self.smooth_edges:
-                        depth_smooth = cv2.GaussianBlur(depth, (3, 3), 0.5)
-                        mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+                        depth_smooth = cv2.GaussianBlur(final_depth, (3, 3), 0.5)
+                        mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
                     else:
-                        mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth, rtol=0.04)
+                        mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(final_depth, rtol=0.04)
                     
-                    # Create mesh
-                    if normal is None:
-                        faces, vertices, vertex_colors, _ = utils3d.numpy.image_mesh(
-                            points,
-                            image.astype(np.float32) / 255,
-                            utils3d.numpy.image_uv(width=width, height=height),
+                    # Prepare texture for mesh generation
+                    # Always scale texture to match model resolution for proper UV mapping
+                    if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                        # Scale down the high-resolution texture to match model resolution for UV mapping
+                        mesh_texture = cv2.resize(texture_image, (final_width, final_height), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        mesh_texture = texture_image
+                    
+                    # Create mesh with geometry at model resolution and colors from texture
+                    if final_normal is None:
+                        faces, vertices, vertex_colors, vertex_uvs = utils3d.numpy.image_mesh(
+                            final_points,
+                            mesh_texture.astype(np.float32) / 255,
+                            utils3d.numpy.image_uv(width=final_width, height=final_height),
                             mask=mask_cleaned,
                             tri=True
                         )
                         vertex_normals = None
                     else:
-                        faces, vertices, vertex_colors, _, vertex_normals = utils3d.numpy.image_mesh(
-                            points,
-                            image.astype(np.float32) / 255,
-                            utils3d.numpy.image_uv(width=width, height=height),
-                            normal,
+                        faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.numpy.image_mesh(
+                            final_points,
+                            mesh_texture.astype(np.float32) / 255,
+                            utils3d.numpy.image_uv(width=final_width, height=final_height),
+                            final_normal,
                             mask=mask_cleaned,
                             tri=True
                         )
+                    
+                    # If full resolution output is enabled, resample vertex colors using proper UV mapping
+                    if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                        # Use UV coordinates to sample from high-resolution texture - O(1) per vertex
+                        high_res_colors = texture_image.astype(np.float32) / 255.0
+                        texture_h, texture_w = texture_width, texture_height
+                        
+                        # Sample colors using UV coordinates (much more accurate than pixel indexing)
+                        for i in range(len(vertex_colors)):
+                            u, v = vertex_uvs[i]
+                            # Convert UV [0,1] to pixel coordinates in high-res texture
+                            x = int(u * (texture_w - 1))
+                            y = int(v * (texture_h - 1))
+                            # Clamp to texture bounds (redundant but safe)
+                            x = max(0, min(x, texture_w - 1))
+                            y = max(0, min(y, texture_h - 1))
+                            vertex_colors[i] = high_res_colors[y, x]
                     
                     # Convert coordinates
                     vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
@@ -1243,22 +1394,24 @@ class MoGeViewer:
         """Process a single frame to 3D"""
         try:
             # Convert BGR to RGB
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            original_height, original_width = image.shape[:2]
+            original_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            original_height, original_width = original_image.shape[:2]
             
-            # Apply input resolution scaling
+            # Prepare image for model processing
             if self.input_resolution_scale != 1.0:
-                new_width = int(original_width * self.input_resolution_scale)
-                new_height = int(original_height * self.input_resolution_scale)
-                image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                # Scale down for model input
+                model_width = int(original_width * self.input_resolution_scale)
+                model_height = int(original_height * self.input_resolution_scale)
+                model_image = cv2.resize(original_image, (model_width, model_height), interpolation=cv2.INTER_AREA)
+            else:
+                model_image = original_image.copy()
+                model_width, model_height = original_width, original_height
             
-            height, width = image.shape[:2]
-            
-            # Apply post-processing
-            image = self.apply_post_processing(image)
+            # Apply post-processing to model input
+            model_image = self.apply_post_processing(model_image)
             
             # Convert to tensor
-            image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+            image_tensor = torch.tensor(model_image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
             image_tensor = image_tensor.permute(2, 0, 1)
             
             # Run inference
@@ -1273,35 +1426,76 @@ class MoGeViewer:
             if normal is not None:
                 normal = normal.cpu().numpy()
             
+            # Mesh geometry always uses model resolution (controlled by input_resolution_scale)
+            final_points = points
+            final_depth = depth
+            final_mask = mask
+            final_normal = normal
+            final_width, final_height = model_width, model_height
+            
+            # Texture resolution depends on full_resolution_output setting
+            if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                # Use original high-resolution image for texture sampling
+                texture_image = self.apply_post_processing(original_image)
+                texture_width, texture_height = original_width, original_height
+            else:
+                # Use model resolution image for texture
+                texture_image = model_image
+                texture_width, texture_height = model_width, model_height
+            
             # Clean mask
             if self.smooth_edges:
                 # Apply simple smoothing to depth for cleaner edges
-                # Use gaussian blur which works well with float32
-                depth_smooth = cv2.GaussianBlur(depth, (3, 3), 0.5)
-                mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+                depth_smooth = cv2.GaussianBlur(final_depth, (3, 3), 0.5)
+                mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
             else:
                 # Standard edge detection without smoothing
-                mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth, rtol=0.04)
+                mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(final_depth, rtol=0.04)
             
-            # Create mesh
-            if normal is None:
-                faces, vertices, vertex_colors, _ = utils3d.numpy.image_mesh(
-                    points,
-                    image.astype(np.float32) / 255,
-                    utils3d.numpy.image_uv(width=width, height=height),
+            # Prepare texture for mesh generation
+            # Always scale texture to match model resolution for proper UV mapping
+            if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                # Scale down the high-resolution texture to match model resolution for UV mapping
+                mesh_texture = cv2.resize(texture_image, (final_width, final_height), interpolation=cv2.INTER_LINEAR)
+            else:
+                mesh_texture = texture_image
+            
+            # Create mesh with geometry at model resolution and colors from texture
+            if final_normal is None:
+                faces, vertices, vertex_colors, vertex_uvs = utils3d.numpy.image_mesh(
+                    final_points,
+                    mesh_texture.astype(np.float32) / 255,
+                    utils3d.numpy.image_uv(width=final_width, height=final_height),
                     mask=mask_cleaned,
                     tri=True
                 )
                 vertex_normals = None
             else:
-                faces, vertices, vertex_colors, _, vertex_normals = utils3d.numpy.image_mesh(
-                    points,
-                    image.astype(np.float32) / 255,
-                    utils3d.numpy.image_uv(width=width, height=height),
-                    normal,
+                faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.numpy.image_mesh(
+                    final_points,
+                    mesh_texture.astype(np.float32) / 255,
+                    utils3d.numpy.image_uv(width=final_width, height=final_height),
+                    final_normal,
                     mask=mask_cleaned,
                     tri=True
                 )
+            
+            # If full resolution output is enabled, resample vertex colors using proper UV mapping
+            if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                # Use UV coordinates to sample from high-resolution texture - O(1) per vertex
+                high_res_colors = texture_image.astype(np.float32) / 255.0
+                texture_h, texture_w = texture_height, texture_width
+                
+                # Sample colors using UV coordinates (much more accurate than pixel indexing)
+                for i in range(len(vertex_colors)):
+                    u, v = vertex_uvs[i]
+                    # Convert UV [0,1] to pixel coordinates in high-res texture
+                    x = int(u * (texture_w - 1))
+                    y = int(v * (texture_h - 1))
+                    # Clamp to texture bounds (redundant but safe)
+                    x = max(0, min(x, texture_w - 1))
+                    y = max(0, min(y, texture_h - 1))
+                    vertex_colors[i] = high_res_colors[y, x]
             
             # Convert coordinates
             vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
@@ -1376,31 +1570,24 @@ class MoGeViewer:
         def _process():
             try:
                 # Load image
-                image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
-                original_height, original_width = image.shape[:2]
+                original_image = cv2.cvtColor(cv2.imread(image_path), cv2.COLOR_BGR2RGB)
+                original_height, original_width = original_image.shape[:2]
                 
-                # Resize if too large (but keep good quality)
-                max_size = 1280
-                if max(original_height, original_width) > max_size:
-                    scale = max_size / max(original_height, original_width)
-                    new_width = int(original_width * scale)
-                    new_height = int(original_height * scale)
-                    image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-                    original_height, original_width = new_height, new_width
-                
-                # Apply input resolution scaling
+                # Prepare image for model processing
                 if self.input_resolution_scale != 1.0:
-                    new_width = int(original_width * self.input_resolution_scale)
-                    new_height = int(original_height * self.input_resolution_scale)
-                    image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                    # Scale down for model input
+                    model_width = int(original_width * self.input_resolution_scale)
+                    model_height = int(original_height * self.input_resolution_scale)
+                    model_image = cv2.resize(original_image, (model_width, model_height), interpolation=cv2.INTER_AREA)
+                else:
+                    model_image = original_image.copy()
+                    model_width, model_height = original_width, original_height
                 
-                height, width = image.shape[:2]
-                
-                # Apply post-processing
-                image = self.apply_post_processing(image)
+                # Apply post-processing to model input
+                model_image = self.apply_post_processing(model_image)
                 
                 # Convert to tensor
-                image_tensor = torch.tensor(image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+                image_tensor = torch.tensor(model_image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
                 image_tensor = image_tensor.permute(2, 0, 1)
                 
                 # Run inference
@@ -1415,35 +1602,76 @@ class MoGeViewer:
                 if normal is not None:
                     normal = normal.cpu().numpy()
                 
+                # Mesh geometry always uses model resolution (controlled by input_resolution_scale)
+                final_points = points
+                final_depth = depth
+                final_mask = mask
+                final_normal = normal
+                final_width, final_height = model_width, model_height
+                
+                # Texture resolution depends on full_resolution_output setting
+                if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                    # Use original high-resolution image for texture sampling
+                    texture_image = self.apply_post_processing(original_image)
+                    texture_width, texture_height = original_width, original_height
+                else:
+                    # Use model resolution image for texture
+                    texture_image = model_image
+                    texture_width, texture_height = model_width, model_height
+                
                 # Clean mask
                 if self.smooth_edges:
                     # Apply simple smoothing to depth for cleaner edges
-                    # Use gaussian blur which works well with float32
-                    depth_smooth = cv2.GaussianBlur(depth, (3, 3), 0.5)
-                    mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+                    depth_smooth = cv2.GaussianBlur(final_depth, (3, 3), 0.5)
+                    mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
                 else:
                     # Standard edge detection without smoothing
-                    mask_cleaned = mask & ~utils3d.numpy.depth_edge(depth, rtol=0.04)
+                    mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(final_depth, rtol=0.04)
                 
-                # Create mesh
-                if normal is None:
-                    faces, vertices, vertex_colors, _ = utils3d.numpy.image_mesh(
-                        points,
-                        image.astype(np.float32) / 255,
-                        utils3d.numpy.image_uv(width=width, height=height),
+                # Prepare texture for mesh generation
+                # Always scale texture to match model resolution for proper UV mapping
+                if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                    # Scale down the high-resolution texture to match model resolution for UV mapping
+                    mesh_texture = cv2.resize(texture_image, (final_width, final_height), interpolation=cv2.INTER_LINEAR)
+                else:
+                    mesh_texture = texture_image
+                
+                # Create mesh with geometry at model resolution and colors from texture
+                if final_normal is None:
+                    faces, vertices, vertex_colors, vertex_uvs = utils3d.numpy.image_mesh(
+                        final_points,
+                        mesh_texture.astype(np.float32) / 255,
+                        utils3d.numpy.image_uv(width=final_width, height=final_height),
                         mask=mask_cleaned,
                         tri=True
                     )
                     vertex_normals = None
                 else:
-                    faces, vertices, vertex_colors, _, vertex_normals = utils3d.numpy.image_mesh(
-                        points,
-                        image.astype(np.float32) / 255,
-                        utils3d.numpy.image_uv(width=width, height=height),
-                        normal,
+                    faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.numpy.image_mesh(
+                        final_points,
+                        mesh_texture.astype(np.float32) / 255,
+                        utils3d.numpy.image_uv(width=final_width, height=final_height),
+                        final_normal,
                         mask=mask_cleaned,
                         tri=True
                     )
+                
+                # If full resolution output is enabled, resample vertex colors using proper UV mapping
+                if self.full_resolution_output and self.input_resolution_scale != 1.0:
+                    # Use UV coordinates to sample from high-resolution texture - O(1) per vertex
+                    high_res_colors = texture_image.astype(np.float32) / 255.0
+                    texture_h, texture_w = texture_height, texture_width
+                    
+                    # Sample colors using UV coordinates (much more accurate than pixel indexing)
+                    for i in range(len(vertex_colors)):
+                        u, v = vertex_uvs[i]
+                        # Convert UV [0,1] to pixel coordinates in high-res texture
+                        x = int(u * (texture_w - 1))
+                        y = int(v * (texture_h - 1))
+                        # Clamp to texture bounds (redundant but safe)
+                        x = max(0, min(x, texture_w - 1))
+                        y = max(0, min(y, texture_h - 1))
+                        vertex_colors[i] = high_res_colors[y, x]
                 
                 # Convert coordinates
                 vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
@@ -1463,6 +1691,11 @@ class MoGeViewer:
                 
                 self.status_message = f"Loaded: {Path(image_path).name} ({len(vertices):,} vertices)"
                 print(f"Mesh created: {len(vertices):,} vertices, {len(faces):,} faces")
+                
+                # Track this as the last processed static image and update settings (only if not refreshing)
+                if not self.is_refreshing:
+                    self.last_processed_image = image_path
+                    self.update_last_settings()
                 
             except Exception as e:
                 self.status_message = f"Error: {str(e)}"
@@ -1498,6 +1731,292 @@ class MoGeViewer:
         
         # Set initial viewport
         self.update_viewport()
+        
+        # Initialize framebuffers for DOF
+        self.init_framebuffers()
+        
+        # Initialize shaders
+        self.init_shaders()
+    
+    def init_shaders(self):
+        """Initialize GLSL shaders for depth of field"""
+        if self.shaders_initialized:
+            return
+            
+        try:
+            # Vertex shader - simple passthrough
+            vertex_shader_source = """
+            #version 120
+            
+            void main() {
+                gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+                gl_TexCoord[0] = gl_MultiTexCoord0;
+            }
+            """
+            
+            # Fragment shader - Two-pass Gaussian DOF
+            # First pass: Horizontal blur
+            horizontal_blur_source = """
+            #version 120
+            
+            uniform sampler2D colorTexture;
+            uniform sampler2D depthTexture;
+            
+            uniform float focusDistance;
+            uniform float focusRange;
+            uniform float blurStrength;
+            uniform vec2 screenSize;
+            
+            const int kernelRadius = 8;
+            const float gaussian[9] = float[](
+                0.324, 0.232, 0.146, 0.081, 0.039, 0.017, 0.006, 0.002, 0.0004
+            );
+            
+            float getLinearDepth(vec2 uv) {
+                float depth = texture2D(depthTexture, uv).r;
+                float near = 0.1;
+                float far = 1000.0;
+                float z_n = 2.0 * depth - 1.0;
+                float linearDepth = 2.0 * near * far / (far + near - z_n * (far - near));
+                return linearDepth;
+            }
+            
+            float getCoC(float depth) {
+                float dist = abs(depth - focusDistance);
+                
+                // Smooth transition from sharp to blurred
+                float coc = 0.0;
+                
+                // Near blur (objects closer than focus)
+                if (depth < focusDistance) {
+                    float nearStart = focusDistance * 0.7;
+                    coc = smoothstep(focusDistance, nearStart, depth);
+                }
+                // Far blur (objects farther than focus)
+                else {
+                    float farStart = focusDistance + focusRange * 0.5;
+                    float farEnd = focusDistance + focusRange * 2.0;
+                    coc = smoothstep(farStart, farEnd, depth);
+                }
+                
+                return coc * blurStrength;
+            }
+            
+            void main() {
+                vec2 uv = gl_TexCoord[0].xy;
+                vec2 texelSize = 1.0 / screenSize;
+                
+                float centerDepth = getLinearDepth(uv);
+                float coc = getCoC(centerDepth);
+                
+                if (coc < 0.001) {
+                    gl_FragColor = vec4(texture2D(colorTexture, uv).rgb, coc);
+                    return;
+                }
+                
+                vec3 color = vec3(0.0);
+                float totalWeight = 0.0;
+                
+                // Horizontal blur pass
+                for (int i = -kernelRadius; i <= kernelRadius; i++) {
+                    vec2 offset = vec2(float(i) * texelSize.x * coc * 4.0, 0.0);  // Reduced radius
+                    vec2 sampleUV = clamp(uv + offset, vec2(0.001), vec2(0.999));
+                    
+                    int idx = i < 0 ? -i : i;  // Manual abs for integers
+                    float weight = gaussian[idx];
+                    color += texture2D(colorTexture, sampleUV).rgb * weight;
+                    totalWeight += weight;
+                }
+                
+                if (totalWeight > 0.0) {
+                    color /= totalWeight;
+                }
+                
+                gl_FragColor = vec4(color, coc);  // Store CoC in alpha for second pass
+            }
+            """
+            
+            # Second pass: Vertical blur
+            vertical_blur_source = """
+            #version 120
+            
+            uniform sampler2D colorTexture;
+            uniform vec2 screenSize;
+            
+            const int kernelRadius = 8;
+            const float gaussian[9] = float[](
+                0.324, 0.232, 0.146, 0.081, 0.039, 0.017, 0.006, 0.002, 0.0004
+            );
+            
+            void main() {
+                vec2 uv = gl_TexCoord[0].xy;
+                vec2 texelSize = 1.0 / screenSize;
+                
+                vec4 centerSample = texture2D(colorTexture, uv);
+                float coc = centerSample.a;
+                
+                if (coc < 0.001) {
+                    gl_FragColor = vec4(centerSample.rgb, 1.0);
+                    return;
+                }
+                
+                vec3 color = vec3(0.0);
+                float totalWeight = 0.0;
+                
+                // Vertical blur pass
+                for (int i = -kernelRadius; i <= kernelRadius; i++) {
+                    vec2 offset = vec2(0.0, float(i) * texelSize.y * coc * 4.0);  // Reduced radius
+                    vec2 sampleUV = clamp(uv + offset, vec2(0.001), vec2(0.999));
+                    
+                    int idx = i < 0 ? -i : i;  // Manual abs for integers
+                    float weight = gaussian[idx];
+                    color += texture2D(colorTexture, sampleUV).rgb * weight;
+                    totalWeight += weight;
+                }
+                
+                if (totalWeight > 0.0) {
+                    color /= totalWeight;
+                }
+                
+                gl_FragColor = vec4(color, 1.0);
+            }
+            """
+            
+            # Compile shaders
+            vertex_shader = compileShader(vertex_shader_source, GL_VERTEX_SHADER)
+            h_blur_shader = compileShader(horizontal_blur_source, GL_FRAGMENT_SHADER)
+            v_blur_shader = compileShader(vertical_blur_source, GL_FRAGMENT_SHADER)
+            
+            # Create shader programs
+            self.dof_shader_h = compileProgram(vertex_shader, h_blur_shader)
+            self.dof_shader_v = compileProgram(vertex_shader, v_blur_shader)
+            
+            # Get uniform locations for horizontal pass
+            glUseProgram(self.dof_shader_h)
+            self.dof_uniforms_h = {
+                'colorTexture': glGetUniformLocation(self.dof_shader_h, 'colorTexture'),
+                'depthTexture': glGetUniformLocation(self.dof_shader_h, 'depthTexture'),
+                'focusDistance': glGetUniformLocation(self.dof_shader_h, 'focusDistance'),
+                'focusRange': glGetUniformLocation(self.dof_shader_h, 'focusRange'),
+                'blurStrength': glGetUniformLocation(self.dof_shader_h, 'blurStrength'),
+                'screenSize': glGetUniformLocation(self.dof_shader_h, 'screenSize')
+            }
+            
+            # Get uniform locations for vertical pass
+            glUseProgram(self.dof_shader_v)
+            self.dof_uniforms_v = {
+                'colorTexture': glGetUniformLocation(self.dof_shader_v, 'colorTexture'),
+                'screenSize': glGetUniformLocation(self.dof_shader_v, 'screenSize')
+            }
+            
+            glUseProgram(0)
+            
+            # Keep the old reference for compatibility
+            self.dof_shader = self.dof_shader_h
+            self.dof_uniforms = self.dof_uniforms_h
+            
+            self.shaders_initialized = True
+            print("Two-pass DOF shaders initialized successfully")
+            
+        except Exception as e:
+            print(f"Error initializing shaders: {e}")
+            self.shaders_initialized = False
+    
+    def init_framebuffers(self):
+        """Initialize framebuffers for depth of field rendering"""
+        if self.framebuffers_initialized:
+            return
+            
+        try:
+            # Create textures
+            self.scene_texture = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, self.scene_texture)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, self.width, self.height, 0, GL_RGB, GL_UNSIGNED_BYTE, None)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            
+            # Depth texture
+            self.depth_texture = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, self.depth_texture)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, self.width, self.height, 0, GL_DEPTH_COMPONENT, GL_FLOAT, None)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            
+            # Intermediate texture for two-pass blur
+            self.blur_texture = glGenTextures(1)
+            glBindTexture(GL_TEXTURE_2D, self.blur_texture)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, self.width, self.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            
+            # Create framebuffers
+            self.fbo_scene = glGenFramebuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, self.fbo_scene)
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.scene_texture, 0)
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, self.depth_texture, 0)
+            
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                print("Scene framebuffer incomplete!")
+            
+            # Create blur framebuffer
+            self.fbo_blur = glGenFramebuffers(1)
+            glBindFramebuffer(GL_FRAMEBUFFER, self.fbo_blur)
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, self.blur_texture, 0)
+            
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                print("Blur framebuffer incomplete!")
+                
+            # Unbind framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+            
+            self.framebuffers_initialized = True
+            
+        except Exception as e:
+            print(f"Error initializing framebuffers: {e}")
+            self.framebuffers_initialized = False
+    
+    def cleanup_framebuffers(self):
+        """Clean up framebuffer objects"""
+        if self.fbo_scene:
+            glDeleteFramebuffers(1, [self.fbo_scene])
+            self.fbo_scene = None
+        
+        if hasattr(self, 'fbo_blur') and self.fbo_blur:
+            glDeleteFramebuffers(1, [self.fbo_blur])
+            self.fbo_blur = None
+            
+        if self.scene_texture:
+            glDeleteTextures([self.scene_texture])
+            self.scene_texture = None
+        if self.depth_texture:
+            glDeleteTextures([self.depth_texture])
+            self.depth_texture = None
+        if hasattr(self, 'blur_texture') and self.blur_texture:
+            glDeleteTextures([self.blur_texture])
+            self.blur_texture = None
+            
+        self.framebuffers_initialized = False
+    
+    def cleanup_shaders(self):
+        """Clean up shader programs"""
+        try:
+            if hasattr(self, 'dof_shader_h') and self.dof_shader_h:
+                glDeleteProgram(self.dof_shader_h)
+                self.dof_shader_h = None
+            if hasattr(self, 'dof_shader_v') and self.dof_shader_v:
+                glDeleteProgram(self.dof_shader_v)
+                self.dof_shader_v = None
+            # Don't delete dof_shader since it's just a reference to dof_shader_h
+            self.dof_shader = None
+        except Exception as e:
+            print(f"Error cleaning up shaders: {e}")
+        self.shaders_initialized = False
     
     def update_viewport(self):
         """Update OpenGL viewport when window size changes"""
@@ -1545,6 +2064,14 @@ class MoGeViewer:
         if self.imgui_renderer:
             io = imgui.get_io()
             io.display_size = (self.width, self.height)
+            
+        # Reinitialize framebuffers on resize
+        self.cleanup_framebuffers()
+        self.init_framebuffers()
+        
+        # Reinitialize shaders if needed
+        if not self.shaders_initialized:
+            self.init_shaders()
         
     def draw_axes(self):
         """Draw coordinate axes"""
@@ -1587,7 +2114,7 @@ class MoGeViewer:
         glEnable(GL_DEPTH_TEST)
         glDepthFunc(GL_LESS)
         
-        # Bind VBOs and draw
+        # Draw the mesh (regular drawing code)
         try:
             # Enable client states
             glEnableClientState(GL_VERTEX_ARRAY)
@@ -1628,6 +2155,8 @@ class MoGeViewer:
         
         # Restore OpenGL state
         glPopAttrib()
+    
+
     
     def update_window_title(self):
         """Update window title with status"""
@@ -1692,8 +2221,8 @@ class MoGeViewer:
                 # Set mesh info for UI
                 self.mesh_info = f"{len(self.vertices):,} vertices, {len(self.faces):,} faces"
                 
-                # Reset camera if needed (for static images)
-                if self.pending_mesh['center'] is not None:
+                # Reset camera if needed (for static images, but not during auto-refresh)
+                if self.pending_mesh['center'] is not None and not self.is_refreshing:
                     center = self.pending_mesh['center']
                     scale = self.pending_mesh['scale']
                     # Position camera to view the mesh properly
@@ -1703,9 +2232,25 @@ class MoGeViewer:
                     self.camera_front = direction / np.linalg.norm(direction)
                     self.camera_up = np.array([0.0, 1.0, 0.0])
                     
+                    # Auto-set DOF focus distance for natural look
+                    # Focus on the center of the mesh
+                    self.focal_blur_distance = np.linalg.norm(self.camera_pos - center)
+                    self.focal_blur_range = scale * 0.8  # Standard range based on mesh scale
+                    
                     print(f"Camera positioned at: {self.camera_pos}")
                     print(f"Looking at mesh center: {center}")
                     print(f"Mesh scale: {scale}")
+                    print(f"Auto DOF focus: {self.focal_blur_distance:.1f}, range: {self.focal_blur_range:.1f}")
+                elif self.is_refreshing and self.saved_camera_pos is not None:
+                    # Restore saved camera position after refresh
+                    self.camera_pos = self.saved_camera_pos
+                    self.camera_front = self.saved_camera_front
+                    self.camera_up = self.saved_camera_up
+                    print(f"Restored camera position after refresh: {self.camera_pos}")
+                    # Update settings after successful refresh
+                    self.update_last_settings()
+                    # Clear refresh flag
+                    self.is_refreshing = False
                 
                 # Create VBOs on main thread
                 self.create_vbos()
@@ -1723,6 +2268,10 @@ class MoGeViewer:
         
         # Process events for ImGui
         self.imgui_renderer.process_inputs()
+        
+        # Check if we should auto-refresh the last processed image
+        if self.check_if_should_refresh_image():
+            self.refresh_last_image()
         
         # Remove thumbnail processing since we're not using thumbnails anymore
         # if self.show_window_selector_dialog:
@@ -1979,6 +2528,9 @@ class MoGeViewer:
         # Hamburger menu icon (three lines)
         if imgui.button("☰", 35, 35):
             self.show_sidebar = True
+        
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Show sidebar controls")
             
         imgui.pop_style_var(2)
         imgui.pop_style_color(3)
@@ -2022,6 +2574,8 @@ class MoGeViewer:
                 if is_selected:
                     imgui.set_item_default_focus()
             imgui.end_combo()
+        if imgui.is_item_hovered():
+            imgui.set_tooltip(f"Switch between different 3D reconstruction models\nCurrent: {description}")
         imgui.pop_item_width()
         
         imgui.pop_style_color()
@@ -2033,10 +2587,14 @@ class MoGeViewer:
         if self.loading:
             imgui.push_style_color(imgui.COLOR_TEXT, 0.9, 0.7, 0.3, 1.0)
             imgui.text("Loading...")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Model is being loaded into GPU memory")
             imgui.pop_style_color()
         elif self.model is not None:
             imgui.push_style_color(imgui.COLOR_TEXT, 0.3, 0.9, 0.5, 1.0)
             imgui.text("Ready")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Model is loaded and ready for 3D reconstruction")
             imgui.pop_style_color()
     
     def render_input_sources(self, content_width):
@@ -2062,6 +2620,11 @@ class MoGeViewer:
             imgui.set_tooltip("Scale input resolution before model processing\n(Lower = faster, higher = better quality)")
         imgui.pop_item_width()
         
+        # Full resolution output toggle
+        changed, self.full_resolution_output = imgui.checkbox("Full Resolution Output", self.full_resolution_output)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("When enabled, vertex colors are sampled from the full-resolution image\nWhen disabled, vertex colors match the model's processing resolution\nNote: Mesh geometry always uses the model's resolution (controlled by Input Resolution)")
+        
         imgui.spacing()
         
         # Camera button
@@ -2074,6 +2637,10 @@ class MoGeViewer:
                 self.stop_camera()
             else:
                 self.start_camera()
+        
+        if imgui.is_item_hovered():
+            status = "Stop live camera feed" if self.camera_active else "Start live camera feed"
+            imgui.set_tooltip(f"{status}\nCapture live video from your camera for real-time 3D reconstruction")
         
         imgui.pop_style_var()
         imgui.pop_style_color()
@@ -2091,6 +2658,10 @@ class MoGeViewer:
             else:
                 self.start_screen()
         
+        if imgui.is_item_hovered():
+            status = "Stop screen capture" if self.screen_active else "Start screen capture"
+            imgui.set_tooltip(f"{status}\nCapture your screen or selected window for 3D reconstruction")
+        
         imgui.pop_style_var()
         imgui.pop_style_color()
         
@@ -2103,6 +2674,9 @@ class MoGeViewer:
         
         if imgui.button("Browse Files...", button_width, button_height):
             self.open_file_dialog()
+        
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Browse and select images or videos from your computer\nSupported formats: JPG, PNG, MP4, AVI, MOV, MKV")
         
         imgui.pop_style_var()
         imgui.pop_style_color(2)
@@ -2117,8 +2691,16 @@ class MoGeViewer:
         
         # Checkboxes with custom styling
         changed, self.wireframe = imgui.checkbox("Wireframe Mode", self.wireframe)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Toggle wireframe rendering mode\nShows the 3D mesh structure as lines instead of solid surfaces")
+        
         changed, self.show_axes = imgui.checkbox("Show Axes", self.show_axes)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Display 3D coordinate axes\nRed = X, Green = Y, Blue = Z")
+        
         changed, self.smooth_edges = imgui.checkbox("Edge Smoothing", self.smooth_edges)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Enable anti-aliasing for smoother edges\nImproves visual quality but may reduce performance")
         
         imgui.spacing()
         
@@ -2126,6 +2708,9 @@ class MoGeViewer:
         button_width = content_width
         if imgui.button("Advanced Settings", button_width):
             self.show_settings_panel = not self.show_settings_panel
+        
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Open advanced settings panel\nConfigure screen capture scale, performance options, and more")
     
     def render_mesh_status(self, content_width):
         """Render mesh status information"""
@@ -2138,17 +2723,29 @@ class MoGeViewer:
         if self.has_mesh:
             imgui.push_style_color(imgui.COLOR_TEXT, 0.3, 0.9, 0.5, 1.0)
             imgui.text("3D Mesh Loaded")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("3D mesh has been successfully reconstructed and loaded")
             imgui.pop_style_color()
             
             imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
             imgui.text(f"{len(self.vertices):,} vertices")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Number of 3D points in the mesh\nMore vertices = higher detail")
+            
             imgui.text(f"{len(self.faces):,} faces")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Number of triangular faces in the mesh\nFaces connect vertices to form the surface")
+            
             if self.vertex_normals is not None:
                 imgui.text("Has normals")
+                if imgui.is_item_hovered():
+                    imgui.set_tooltip("Mesh has normal vectors for proper lighting and shading")
             imgui.pop_style_color()
         else:
             imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
             imgui.text("No mesh loaded")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("No 3D mesh currently loaded\nCapture or load content to generate a 3D mesh")
             imgui.pop_style_color()
     
     def render_camera_controls(self, content_width):
@@ -2159,20 +2756,85 @@ class MoGeViewer:
         
         imgui.spacing()
         
+        # Field of View slider
+        imgui.push_item_width(content_width - 80)
+        changed, self.camera_fov = imgui.slider_float(
+            "Field of View",
+            self.camera_fov,
+            30.0, 120.0, "%.0f°"
+        )
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Camera field of view angle\nLower = zoomed in, Higher = wide angle")
+        
+        imgui.spacing()
+        
+        # Depth of Field section
+        imgui.push_style_color(imgui.COLOR_TEXT, 0.6, 0.6, 0.6, 1.0)
+        imgui.text("Depth of Field")
+        imgui.pop_style_color()
+        
+        # Enable depth of field
+        changed, self.enable_focal_blur = imgui.checkbox("Enable DOF", self.enable_focal_blur)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Enable cinematic depth of field effect\nCreates natural blur for out-of-focus areas like in AAA games")
+        
+        if self.enable_focal_blur:
+            # Focus distance
+            changed, self.focal_blur_distance = imgui.slider_float(
+                "Focus Distance", 
+                self.focal_blur_distance, 
+                0.1, 20.0, "%.1f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Distance to the focal plane from camera\nObjects at this distance will be sharp")
+            
+            # Auto-focus button
+            if imgui.button("Auto Focus", content_width - 80):
+                # Set focus distance to the center of the mesh if visible
+                if self.has_mesh and self.vertices is not None:
+                    mesh_center = np.mean(self.vertices, axis=0)
+                    self.focal_blur_distance = np.linalg.norm(mesh_center - self.camera_pos)
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Automatically set focus distance to the center of the 3D mesh")
+            
+            # DOF strength
+            changed, self.focal_blur_strength = imgui.slider_float(
+                "DOF Strength", 
+                self.focal_blur_strength, 
+                0.0, 1.0, "%.2f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Intensity of the depth of field effect\nHigher values create stronger blur")
+            
+            # DOF range
+            changed, self.focal_blur_range = imgui.slider_float(
+                "Focus Range", 
+                self.focal_blur_range, 
+                0.5, 10.0, "%.1f"
+            )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Range of sharp focus around the focal distance\nSmaller values create shallower depth of field")
+        
+        imgui.pop_item_width()
+        
+        imgui.spacing()
+        
         # Control hints
         controls = [
-            ("WASD", "Move"),
-            ("QE", "Up/Down"),
-            ("L-Drag", "Look"),
-            ("R-Drag", "Pan"),
-            ("Wheel", "Forward/Back"),
-            ("Shift", "Faster"),
-            ("Tab", "Toggle UI"),
+            ("WASD", "Move", "Move forward/back and strafe left/right"),
+            ("QE", "Up/Down", "Move up and down in 3D space"),
+            ("L-Drag", "Look", "Look around by dragging with left mouse button"),
+            ("R-Drag", "Pan", "Pan the view by dragging with right mouse button"),
+            ("Wheel", "Forward/Back", "Move forward/backward using mouse wheel"),
+            ("Shift", "Faster", "Hold Shift to move faster"),
+            ("Tab", "Toggle UI", "Show/hide the user interface"),
         ]
         
         imgui.push_style_color(imgui.COLOR_TEXT, 0.5, 0.5, 0.5, 1.0)
-        for key, action in controls:
+        for key, action, tooltip in controls:
             imgui.text(f"{key}: {action}")
+            if imgui.is_item_hovered():
+                imgui.set_tooltip(tooltip)
         imgui.pop_style_color()
     
     def render_post_processing(self, content_width):
@@ -2185,6 +2847,8 @@ class MoGeViewer:
         
         # Enable checkbox
         changed, self.enable_post_processing = imgui.checkbox("Enable Post-Processing", self.enable_post_processing)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Enable image post-processing effects\nApplies filters and adjustments to improve image quality before 3D reconstruction")
         
         if self.enable_post_processing:
             imgui.spacing()
@@ -2203,6 +2867,8 @@ class MoGeViewer:
                 self.post_process_brightness, 
                 -1.0, 1.0, "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adjust image brightness\nNegative values darken, positive values brighten")
             
             # Contrast
             changed, self.post_process_contrast = imgui.slider_float(
@@ -2210,6 +2876,8 @@ class MoGeViewer:
                 self.post_process_contrast, 
                 0.5, 2.0, "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adjust image contrast\nLower values flatten, higher values increase contrast")
             
             # Saturation
             changed, self.post_process_saturation = imgui.slider_float(
@@ -2217,6 +2885,8 @@ class MoGeViewer:
                 self.post_process_saturation, 
                 0.0, 2.0, "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adjust color saturation\n0 = grayscale, 1 = normal, 2 = vivid colors")
             
             # Gamma
             changed, self.post_process_gamma = imgui.slider_float(
@@ -2224,6 +2894,8 @@ class MoGeViewer:
                 self.post_process_gamma, 
                 0.5, 2.0, "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Adjust gamma correction\nLower values brighten shadows, higher values darken")
             
             imgui.spacing()
             
@@ -2281,6 +2953,8 @@ class MoGeViewer:
                 self.post_process_hue_shift, 
                 -180.0, 180.0, "%.0f°"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Shift the hue of all colors\nRotates the color wheel by specified degrees")
             
             # Vignette
             changed, self.post_process_vignette = imgui.slider_float(
@@ -2307,6 +2981,9 @@ class MoGeViewer:
                 self.post_process_noise_reduction = 0.0
                 self.post_process_edge_enhance = 0.0
                 self.post_process_hue_shift = 0.0
+            
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Reset all post-processing settings to default values")
     
     def render_video_controls(self):
         """Render video player controls"""
@@ -2351,11 +3028,18 @@ class MoGeViewer:
             skip_frames = int(10 * self.video_fps)
             self.seek_video(max(0, current_frame - skip_frames))
         
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Rewind 10 seconds")
+        
         # Play/Pause button
         imgui.same_line()
         play_text = "||" if is_playing else ">"  # Using ASCII instead of Unicode
         if imgui.button(play_text, 30, 25):
             self.toggle_video_playback()
+        
+        if imgui.is_item_hovered():
+            tooltip = "Pause video playback" if is_playing else "Play video"
+            imgui.set_tooltip(tooltip)
         
         # Forward button
         imgui.same_line()
@@ -2363,10 +3047,16 @@ class MoGeViewer:
             skip_frames = int(10 * self.video_fps)
             self.seek_video(min(self.video_total_frames - 1, current_frame + skip_frames))
         
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Fast forward 10 seconds")
+        
         # Stop button
         imgui.same_line()
         if imgui.button("[]", 30, 25):  # Stop - using ASCII
             self.stop_video()
+        
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Stop video playback and return to beginning")
         
         # Time display
         imgui.same_line()
@@ -2377,6 +3067,8 @@ class MoGeViewer:
         total_min = int(total_time // 60)
         total_sec = int(total_time % 60)
         imgui.text(f"{current_min:02d}:{current_sec:02d} / {total_min:02d}:{total_sec:02d}")
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Current playback time / Total video duration")
         
         # Timeline (time-based) with processed frames visualization
         imgui.same_line()
@@ -2463,6 +3155,8 @@ class MoGeViewer:
         imgui.same_line()
         imgui.set_cursor_pos_x(control_width - 190)
         changed, self.video_loop = imgui.checkbox("Loop", self.video_loop)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip("Loop video: restart from beginning when reaching the end")
         
         # Live mode toggle
         imgui.same_line()
@@ -2603,6 +3297,9 @@ class MoGeViewer:
                 self.selected_window = window
                 self.screen_active = True
                 self.status_message = f"Capturing: {window['title']}"
+                
+                # Clear last processed image since we're now in screen capture mode
+                self.last_processed_image = None
                 self.screen_thread = threading.Thread(target=self._capture_screen, daemon=True)
                 self.screen_thread.start()
                 self.cleanup_thumbnail_textures()
@@ -2716,6 +3413,8 @@ class MoGeViewer:
                 0.01, 0.5,
                 "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Minimum time between processing frames\nLower values = faster processing but higher CPU usage")
             
             changed, self.screen_scale = imgui.slider_float(
                 "Screen Capture Scale",
@@ -2723,6 +3422,8 @@ class MoGeViewer:
                 0.1, 1.0,
                 "%.1f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Scale factor for screen capture\nLower values = better performance but lower quality")
             
             imgui.spacing()
             
@@ -2736,6 +3437,8 @@ class MoGeViewer:
                 0.01, 1.0,
                 "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("3D camera movement speed\nHigher values = faster movement with WASD keys")
             
             changed, self.mouse_sensitivity = imgui.slider_float(
                 "Mouse Sensitivity",
@@ -2743,6 +3446,8 @@ class MoGeViewer:
                 0.1, 1.0,
                 "%.2f"
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Mouse look sensitivity\nHigher values = faster camera rotation when dragging")
             
             imgui.spacing()
                 
@@ -2756,6 +3461,9 @@ class MoGeViewer:
                 self.video_buffer_size,
                 30, 1200
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Number of raw video frames to keep in memory\nHigher values = smoother playback but more RAM usage")
+            
             if changed:
                 self.video_buffer_size = new_buffer_size
                 # Recreate buffer with new size if video is active
@@ -2771,6 +3479,9 @@ class MoGeViewer:
                 self.max_mesh_cache,
                 300, 3600
             )
+            if imgui.is_item_hovered():
+                imgui.set_tooltip("Number of processed 3D meshes to keep in memory\nHigher values = instant playback but more RAM usage")
+            
             if changed:
                 self.max_mesh_cache = new_cache_size
                 # Trim cache if needed
@@ -2819,10 +3530,6 @@ class MoGeViewer:
     
     def render(self):
         """Main render function"""
-        # Clear the entire screen first
-        glViewport(0, 0, self.width, self.height)
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        
         # Calculate 3D viewport dimensions (exclude UI areas)
         animated_sidebar_width = self.get_animated_sidebar_width() if self.show_main_ui else 0
         viewport_x = animated_sidebar_width
@@ -2832,46 +3539,176 @@ class MoGeViewer:
             viewport_height -= self.bottom_panel_height
         
         # Only render 3D scene if we have a valid viewport
-        if viewport_width > 0 and viewport_height > 0:
-            # Set viewport for 3D rendering
-            glViewport(viewport_x, 0, viewport_width, viewport_height)
-            
-            # Enable 3D rendering states
-            glEnable(GL_DEPTH_TEST)
-            glEnable(GL_LIGHTING)
-            glEnable(GL_LIGHT0)
-            
-            # Set up projection with correct aspect ratio
-            glMatrixMode(GL_PROJECTION)
-            glLoadIdentity()
-            aspect_ratio = viewport_width / viewport_height
-            gluPerspective(60, aspect_ratio, 0.1, 1000.0)
-        
-            # Set up camera
-            glMatrixMode(GL_MODELVIEW)
-            glLoadIdentity()
-        
-            # Look at
-            camera_target = self.camera_pos + self.camera_front
-            gluLookAt(
-                self.camera_pos[0], self.camera_pos[1], self.camera_pos[2],
-                camera_target[0], camera_target[1], camera_target[2],
-                self.camera_up[0], self.camera_up[1], self.camera_up[2]
-            )
-        
-            # Draw 3D scene
-            if self.show_axes:
-                self.draw_axes()
-        
-            if self.has_mesh:
+        if viewport_width > 0 and viewport_height > 0 and self.has_mesh:
+            # If DOF is enabled and framebuffers are ready, render to framebuffer first
+            if self.enable_focal_blur and self.framebuffers_initialized and self.shaders_initialized and not self.wireframe:
+                # Render scene to framebuffer - needs to match viewport for proper DOF
+                glBindFramebuffer(GL_FRAMEBUFFER, self.fbo_scene)
+                glViewport(0, 0, self.width, self.height)
+                
+                # Clear the entire framebuffer
+                glClearColor(0.0, 0.0, 0.0, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                
+                # Set up 3D rendering
+                glEnable(GL_DEPTH_TEST)
+                glEnable(GL_LIGHTING)
+                glEnable(GL_LIGHT0)
+                
+                # Set up projection with viewport aspect ratio
+                glMatrixMode(GL_PROJECTION)
+                glLoadIdentity()
+                aspect_ratio = viewport_width / float(viewport_height)
+                gluPerspective(self.camera_fov, aspect_ratio, 0.1, 1000.0)
+                
+                # Set up camera
+                glMatrixMode(GL_MODELVIEW)
+                glLoadIdentity()
+                camera_target = self.camera_pos + self.camera_front
+                gluLookAt(
+                    self.camera_pos[0], self.camera_pos[1], self.camera_pos[2],
+                    camera_target[0], camera_target[1], camera_target[2],
+                    self.camera_up[0], self.camera_up[1], self.camera_up[2]
+                )
+                
+                # Draw scene
+                if self.show_axes:
+                    self.draw_axes()
                 self.draw_mesh()
-                # Debug: print camera info when mesh is visible
-                if hasattr(self, '_debug_counter'):
-                    self._debug_counter += 1
-                    if self._debug_counter % 300 == 0:  # Print every 5 seconds at 60fps
-                        print(f"Rendering mesh: {len(self.vertices):,} vertices at camera pos {self.camera_pos}")
-                else:
-                    self._debug_counter = 1
+                
+                # Apply two-pass depth of field effect
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                
+                # Setup for shader-based DOF rendering
+                glDisable(GL_DEPTH_TEST)
+                glDisable(GL_LIGHTING)
+                
+                # First pass: Horizontal blur to intermediate texture
+                glBindFramebuffer(GL_FRAMEBUFFER, self.fbo_blur)
+                glViewport(0, 0, self.width, self.height)
+                glClear(GL_COLOR_BUFFER_BIT)
+                
+                glUseProgram(self.dof_shader_h)
+                
+                # Bind textures
+                glActiveTexture(GL_TEXTURE0)
+                glBindTexture(GL_TEXTURE_2D, self.scene_texture)
+                glUniform1i(self.dof_uniforms_h['colorTexture'], 0)
+                
+                glActiveTexture(GL_TEXTURE1)
+                glBindTexture(GL_TEXTURE_2D, self.depth_texture)
+                glUniform1i(self.dof_uniforms_h['depthTexture'], 1)
+                
+                # Set uniforms
+                glUniform1f(self.dof_uniforms_h['focusDistance'], self.focal_blur_distance)
+                glUniform1f(self.dof_uniforms_h['focusRange'], self.focal_blur_range)
+                glUniform1f(self.dof_uniforms_h['blurStrength'], self.focal_blur_strength)
+                glUniform2f(self.dof_uniforms_h['screenSize'], float(self.width), float(self.height))
+                
+                # Draw fullscreen quad
+                glMatrixMode(GL_PROJECTION)
+                glPushMatrix()
+                glLoadIdentity()
+                glOrtho(0, 1, 0, 1, -1, 1)
+                
+                glMatrixMode(GL_MODELVIEW)
+                glPushMatrix()
+                glLoadIdentity()
+                
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 0); glVertex2f(0, 0)
+                glTexCoord2f(1, 0); glVertex2f(1, 0)
+                glTexCoord2f(1, 1); glVertex2f(1, 1)
+                glTexCoord2f(0, 1); glVertex2f(0, 1)
+                glEnd()
+                
+                glPopMatrix()
+                glMatrixMode(GL_PROJECTION)
+                glPopMatrix()
+                glMatrixMode(GL_MODELVIEW)
+                
+                # Second pass: Vertical blur to screen
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                glViewport(0, 0, self.width, self.height)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                
+                glViewport(viewport_x, 0, viewport_width, viewport_height)
+                
+                glUseProgram(self.dof_shader_v)
+                
+                # Bind blur texture from first pass
+                glActiveTexture(GL_TEXTURE0)
+                glBindTexture(GL_TEXTURE_2D, self.blur_texture)
+                glUniform1i(self.dof_uniforms_v['colorTexture'], 0)
+                
+                # Set uniforms
+                glUniform2f(self.dof_uniforms_v['screenSize'], float(self.width), float(self.height))
+                
+                # Draw final result in viewport space
+                glMatrixMode(GL_PROJECTION)
+                glPushMatrix()
+                glLoadIdentity()
+                glOrtho(0, self.width, self.height, 0, -1, 1)
+                
+                glMatrixMode(GL_MODELVIEW)
+                glPushMatrix()
+                glLoadIdentity()
+                
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 0); glVertex2f(viewport_x, viewport_height)
+                glTexCoord2f(1, 0); glVertex2f(viewport_x + viewport_width, viewport_height)
+                glTexCoord2f(1, 1); glVertex2f(viewport_x + viewport_width, 0)
+                glTexCoord2f(0, 1); glVertex2f(viewport_x, 0)
+                glEnd()
+                
+                glPopMatrix()
+                glMatrixMode(GL_PROJECTION)
+                glPopMatrix()
+                glMatrixMode(GL_MODELVIEW)
+                
+                # Cleanup
+                glUseProgram(0)
+                glActiveTexture(GL_TEXTURE0)
+                
+            else:
+                # Regular rendering without DOF
+                glViewport(0, 0, self.width, self.height)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                
+                glViewport(viewport_x, 0, viewport_width, viewport_height)
+                
+                # Enable 3D rendering states
+                glEnable(GL_DEPTH_TEST)
+                glEnable(GL_LIGHTING)
+                glEnable(GL_LIGHT0)
+                
+                # Set up projection with correct aspect ratio
+                glMatrixMode(GL_PROJECTION)
+                glLoadIdentity()
+                aspect_ratio = viewport_width / float(viewport_height)
+                gluPerspective(self.camera_fov, aspect_ratio, 0.1, 1000.0)
+            
+                # Set up camera
+                glMatrixMode(GL_MODELVIEW)
+                glLoadIdentity()
+            
+                # Look at
+                camera_target = self.camera_pos + self.camera_front
+                gluLookAt(
+                    self.camera_pos[0], self.camera_pos[1], self.camera_pos[2],
+                    camera_target[0], camera_target[1], camera_target[2],
+                    self.camera_up[0], self.camera_up[1], self.camera_up[2]
+                )
+            
+                # Draw 3D scene
+                if self.show_axes:
+                    self.draw_axes()
+                
+                self.draw_mesh()
+        else:
+            # Clear screen if no mesh
+            glViewport(0, 0, self.width, self.height)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         
         # Reset viewport for UI rendering
         glViewport(0, 0, self.width, self.height)
@@ -3086,6 +3923,12 @@ class MoGeViewer:
         
         # Clean up thumbnail textures
         self.cleanup_thumbnail_textures()
+        
+        # Clean up framebuffers
+        self.cleanup_framebuffers()
+        
+        # Clean up shaders
+        self.cleanup_shaders()
         
         # Cleanup ImGui
         if self.imgui_renderer:
