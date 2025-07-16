@@ -71,7 +71,7 @@ class MoGeViewer:
         self.screen_scale = 1.0  # Use full resolution - let input resolution scale control quality
         self.selected_window = None  # Selected window for capture
         
-        # Video playback
+        # Video playback - using proper video library approach
         self.video_path = None
         self.video_capture = None
         self.video_thread = None
@@ -80,26 +80,33 @@ class MoGeViewer:
         self.video_fps = 30.0
         self.video_total_frames = 0
         self.video_current_frame = 0
-        self.video_buffer_size = 600  # Default buffer size (20s at 30fps)
-        self.video_frame_buffer = deque(maxlen=self.video_buffer_size)
-        self.video_buffer_thread = None
-        self.video_live_mode = False  # Live mode drops frames to keep up
+        self.video_live_mode = True  # Start in live mode by default for real-time
         self.video_loop = True  # Loop video by default
-        self.video_seek_requested = False
-        self.video_seek_frame = 0
         self.video_last_frame_time = 0
         self.video_lock = threading.Lock()  # Thread safety for video state
-        self.video_is_seeking = False  # Track seek operations
-        self.video_scale = 1.0  # Scale factor for video frames (unused now - always full res)
-        self.video_resize_scale = 1.0  # User configurable resize scale (unused now)
         
-        # Mesh caching for video frames
-        self.mesh_cache = OrderedDict()  # frame_num -> mesh_data (LRU cache)
-        self.max_mesh_cache = 1800  # ~1 minute at 30fps, adjust based on memory
-        self.processed_frames = set()  # Set of frame numbers that have been processed
-        self.video_processor_thread = None  # Thread for processing frames to 3D
-        self.video_processing_active = False  # Flag for processor thread
-        self._current_displayed_frame = -1  # Track what frame is currently displayed
+        # Simple frame-based approach - let OpenCV handle buffering
+        self.current_mesh = None  # Currently displayed mesh
+        self.mesh_lock = threading.Lock()
+        self.frame_processor_queue = queue.Queue(maxsize=5)  # Small queue for processing
+        self.processed_mesh_queue = queue.Queue(maxsize=3)  # Queue for processed meshes
+        
+        # Mesh cache for video processing
+        self.mesh_cache = {}  # Dictionary to cache mesh data by frame number
+        self.processed_frames = set()  # Set to track which frames have been processed
+        self.max_mesh_cache = 20  # Maximum number of frames to keep in cache
+        
+        # Video frame buffer and processing state
+        self.video_frame_buffer = deque(maxlen=60)  # Buffer for video frames
+        self.video_buffer_size = 60  # Buffer size for video frames
+        self.video_is_seeking = False  # Whether user is seeking through video
+        self.video_seek_requested = False  # Whether a seek operation is requested
+        self.video_seek_frame = 0  # Frame number to seek to
+        self.video_scale = 1.0  # Video scaling factor
+        self._current_displayed_frame = -1  # Currently displayed frame number
+        self.video_processing_active = False  # Whether video processing is active
+        self.video_buffer_thread = None  # Thread for buffering video frames
+        self.video_processor_thread = None  # Thread for processing video frames
         
         # Mesh data
         self.vertices = None
@@ -224,9 +231,9 @@ class MoGeViewer:
         self.dof_shader_v = None
         self.shaders_initialized = False
         
-        # Input processing settings
-        self.input_resolution_scale = 1.0  # 0.1 to 1.0 - scale input before model
-        self.full_resolution_output = True  # If True, upscale output to original resolution
+        # Input processing settings - optimized for real-time
+        self.input_resolution_scale = 0.3  # Start with lower resolution for real-time
+        self.full_resolution_output = False  # Disable for real-time performance
         
         # Auto-refresh tracking for static images
         self.last_processed_image = None  # Path of last processed static image
@@ -696,6 +703,8 @@ class MoGeViewer:
         if self.video_active or self.model is None or self.loading:
             return
             
+        print(f"Starting video: {video_path}")
+        
         try:
             # Stop other capture modes
             if self.camera_active:
@@ -703,25 +712,34 @@ class MoGeViewer:
             if self.screen_active:
                 self.stop_screen()
                 
-            # Open video
+            # Open video with error handling
             self.video_capture = cv2.VideoCapture(video_path)
             if not self.video_capture.isOpened():
                 self.status_message = f"Failed to open video: {Path(video_path).name}"
+                print(f"Failed to open video file: {video_path}")
                 return
                 
-            # Get video properties
-            self.video_fps = self.video_capture.get(cv2.CAP_PROP_FPS) or 30.0
-            self.video_total_frames = int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            # Get video properties with validation
+            self.video_fps = max(1.0, self.video_capture.get(cv2.CAP_PROP_FPS) or 30.0)
+            self.video_total_frames = max(1, int(self.video_capture.get(cv2.CAP_PROP_FRAME_COUNT)))
             video_width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
             video_height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
             
-            # No scaling - always process at full resolution
-            self.video_scale = 1.0
+            print(f"Video properties: {video_width}x{video_height}, {self.video_fps} fps, {self.video_total_frames} frames")
             
+            # Validate video properties
+            if video_width <= 0 or video_height <= 0:
+                self.status_message = f"Invalid video dimensions: {Path(video_path).name}"
+                self.video_capture.release()
+                self.video_capture = None
+                return
+            
+            # Initialize state with proper locking
             with self.video_lock:
                 self.video_current_frame = 0
                 self.video_path = video_path
                 self.video_is_seeking = False
+                self.video_scale = 1.0
                 
                 # Clear caches
                 self.mesh_cache.clear()
@@ -736,6 +754,7 @@ class MoGeViewer:
                 except:
                     pass
             
+            # Set flags
             self.video_active = True
             self.video_playing = False  # Start paused for initial buffering
             self.video_processing_active = True
@@ -748,7 +767,10 @@ class MoGeViewer:
             total_seconds = self.video_total_frames / self.video_fps
             minutes = int(total_seconds // 60)
             seconds = int(total_seconds % 60)
-            self.status_message = f"Buffering video: {Path(video_path).name} ({minutes:02d}:{seconds:02d})"
+            self.status_message = f"Loading video: {Path(video_path).name} ({minutes:02d}:{seconds:02d})"
+            
+            # Start threads in order
+            print("Starting video threads...")
             
             # Start buffer thread (for raw frames)
             self.video_buffer_thread = threading.Thread(target=self._buffer_video_frames, daemon=True)
@@ -762,36 +784,66 @@ class MoGeViewer:
             self.video_thread = threading.Thread(target=self._play_video, daemon=True)
             self.video_thread.start()
             
+            print("Video threads started successfully")
+            
         except Exception as e:
             self.status_message = f"Video error: {str(e)}"
             print(f"Failed to start video: {e}")
+            
+            # Clean up on error
+            if hasattr(self, 'video_capture') and self.video_capture:
+                try:
+                    self.video_capture.release()
+                except:
+                    pass
+                self.video_capture = None
+            
+            self.video_active = False
+            self.video_processing_active = False
+            self.show_video_controls = False
     
     def stop_video(self):
         """Stop video playback"""
+        print("Stopping video...")
+        
+        # Set flags to stop threads
         self.video_active = False
         self.video_playing = False
         self.video_processing_active = False
         self.show_video_controls = False
         
-        # Release video capture early
+        # Release video capture early to prevent blocking
         if self.video_capture is not None:
-            self.video_capture.release()
+            try:
+                self.video_capture.release()
+            except:
+                pass
             self.video_capture = None
             
-        # Try to join threads with timeout
-        if self.video_buffer_thread and self.video_buffer_thread.is_alive():
-            self.video_buffer_thread.join(timeout=1.0)
-        if self.video_processor_thread and self.video_processor_thread.is_alive():
-            self.video_processor_thread.join(timeout=1.0)
-        if self.video_thread and self.video_thread.is_alive():
-            self.video_thread.join(timeout=1.0)
-            
-                # Clear buffers and caches
+        # Wait for threads to finish with proper timeout handling
+        threads_to_join = [
+            ("buffer", self.video_buffer_thread),
+            ("processor", self.video_processor_thread), 
+            ("playback", self.video_thread)
+        ]
+        
+        for thread_name, thread in threads_to_join:
+            if thread and thread.is_alive():
+                print(f"Waiting for {thread_name} thread to stop...")
+                thread.join(timeout=2.0)
+                if thread.is_alive():
+                    print(f"Warning: {thread_name} thread did not stop cleanly")
+        
+        # Clear all buffers and caches safely
         with self.video_lock:
             self.video_frame_buffer.clear()
             self.mesh_cache.clear()
             self.processed_frames.clear()
+            self.video_current_frame = 0
+            self.video_seek_requested = False
+            self.video_is_seeking = False
             
+        # Clear frame queue
         while not self.frame_queue.empty():
             try:
                 self.frame_queue.get_nowait()
@@ -799,106 +851,94 @@ class MoGeViewer:
                 pass
                 
         self.status_message = "Video stopped"
+        print("Video stopped successfully")
     
     def toggle_video_playback(self):
         """Toggle video play/pause"""
-        if self.video_active:
-            with self.video_lock:
-                self.video_playing = not self.video_playing
-                if self.video_playing:
-                    self.video_last_frame_time = time.time()
-                    self.status_message = "Video playing"
-                else:
-                    self.status_message = "Video paused"
+        if not self.video_active:
+            return
+            
+        with self.video_lock:
+            was_playing = self.video_playing
+            self.video_playing = not self.video_playing
+            
+            if self.video_playing:
+                # Starting playback
+                self.video_last_frame_time = time.time()
+                self.status_message = "Video playing"
+                print("Video playback started")
+            else:
+                # Pausing playback
+                self.status_message = "Video paused"
+                print("Video playback paused")
     
     def seek_video(self, frame_number):
-        """Seek to specific frame in video"""
-        if self.video_active and self.video_capture:
-            frame_number = max(0, min(frame_number, self.video_total_frames - 1))
+        """Seek to specific frame in video - non-blocking and freeze-proof"""
+        if not self.video_active or not self.video_capture:
+            return
             
-            with self.video_lock:
-                # Check if frame is already cached
-                if frame_number in self.mesh_cache:
-                    # Instant seek to cached frame
-                    self.video_current_frame = frame_number
-                    self._current_displayed_frame = frame_number
-                    
-                    # Display the cached mesh immediately
-                    mesh_data = self.mesh_cache[frame_number]
-                    with self.mesh_lock:
-                        self.pending_mesh = {
-                            'vertices': mesh_data['vertices'],
-                            'faces': mesh_data['faces'],
-                            'vertex_colors': mesh_data['vertex_colors'],
-                            'vertex_normals': mesh_data['vertex_normals'],
-                            'center': None,
-                            'scale': None
-                        }
-                    
-                    self.status_message = "Video playing" if self.video_playing else "Video paused"
-                    self.video_last_frame_time = time.time()
-                else:
-                    # Need to seek and buffer
-                    was_playing = self.video_playing
-                    self.video_playing = False  # Pause during seek
-                    self.video_is_seeking = True
-                    
-                    # Set seek request
-                    self.video_seek_requested = True
-                    self.video_seek_frame = frame_number
-                    
-                    # Clear raw frame buffer to force re-buffering from seek point
-                    self.video_frame_buffer.clear()
-                    
-                    # Update status
-                    self.status_message = "Seeking..."
-                    
-                    # Resume after some frames are processed
-                    def resume_after_buffer():
-                        # Wait for frame to be processed
-                        wait_time = 0
-                        while wait_time < 5.0:  # Max 5 seconds wait
-                            time.sleep(0.1)
-                            wait_time += 0.1
-                            with self.video_lock:
-                                if frame_number in self.mesh_cache:
-                                    self.video_is_seeking = False
-                                    if was_playing:
-                                        self.video_playing = True
-                                        self.video_last_frame_time = time.time()
-                                    break
-                        else:
-                            # Timeout - resume anyway
-                            with self.video_lock:
-                                self.video_is_seeking = False
-                                if was_playing:
-                                    self.video_playing = True
-                                    self.video_last_frame_time = time.time()
-                            
-                    threading.Thread(target=resume_after_buffer, daemon=True).start()
+        frame_number = max(0, min(frame_number, self.video_total_frames - 1))
+        print(f"Seeking to frame {frame_number}")
+        
+        # Always update displayed frame immediately to prevent slider lag
+        with self.video_lock:
+            self._current_displayed_frame = frame_number
+            
+            # Check if frame is already cached
+            if frame_number in self.mesh_cache:
+                # Instant seek to cached frame
+                print(f"Frame {frame_number} found in cache - instant seek")
+                
+                # Display the cached mesh immediately
+                mesh_data = self.mesh_cache[frame_number]
+                with self.mesh_lock:
+                    self.pending_mesh = {
+                        'vertices': mesh_data['vertices'],
+                        'faces': mesh_data['faces'],
+                        'vertex_colors': mesh_data['vertex_colors'],
+                        'vertex_normals': mesh_data['vertex_normals'],
+                        'center': None,
+                        'scale': None
+                    }
+                
+                self.video_last_frame_time = time.time()
+                self.status_message = "Video playing" if self.video_playing else "Video paused"
+            else:
+                # Frame not cached - request buffering but don't freeze
+                print(f"Frame {frame_number} not in cache - requesting buffer")
+                self.video_seek_requested = True
+                self.video_seek_frame = frame_number
+                
+                # Don't pause playback or set seeking flag - keep playing smoothly
+                self.video_last_frame_time = time.time()
+                self.status_message = "Seeking..." if not self.video_playing else "Video playing"
     
     def _process_video_frames(self):
         """Process video frames to 3D meshes in background"""
+        print("Video processor thread started")
+        
         while self.video_processing_active:
             try:
                 # Get next unprocessed frame from buffer
                 frame_to_process = None
+                frame_num = None
+                
                 with self.video_lock:
                     # Find first unprocessed frame in buffer
-                    for frame_data in self.video_frame_buffer:
-                        frame_num = frame_data['number']
-                        if frame_num not in self.processed_frames:
-                            frame_to_process = frame_data
+                    for frame_data in list(self.video_frame_buffer):  # Create list to avoid modification during iteration
+                        candidate_frame_num = frame_data['number']
+                        if candidate_frame_num not in self.processed_frames:
+                            frame_to_process = frame_data.copy()  # Make a copy to avoid reference issues
+                            frame_num = candidate_frame_num
                             break
                 
                 if frame_to_process is None:
-                    # No unprocessed frames available
-                    time.sleep(0.01)
+                    # No unprocessed frames available - much shorter sleep for real-time
+                    time.sleep(0.001)
                     continue
                 
-                # Process the frame
+                # Process the frame outside of lock
                 frame = frame_to_process['frame']
-                frame_num = frame_to_process['number']
                 
                 try:
                     # Convert BGR to RGB
@@ -918,15 +958,19 @@ class MoGeViewer:
                     # Apply post-processing to model input
                     model_image = self.apply_post_processing(model_image)
                     
-                    # Convert to tensor
-                    image_tensor = torch.tensor(model_image / 255.0, dtype=torch.float16 if self.device.type == "cuda" else torch.float32, device=self.device)
+                    # Convert to tensor with proper device handling
+                    image_tensor = torch.tensor(
+                        model_image / 255.0, 
+                        dtype=torch.float16 if self.device.type == "cuda" else torch.float32, 
+                        device=self.device
+                    )
                     image_tensor = image_tensor.permute(2, 0, 1)
                     
-                    # Run inference
+                    # Run inference with error handling
                     with torch.no_grad():
                         output = self.model.infer(image_tensor, use_fp16=(self.device.type == "cuda"))
                     
-                    # Extract outputs
+                    # Extract outputs safely
                     points = output['points'].cpu().numpy()
                     depth = output['depth'].cpu().numpy()
                     mask = output['mask'].cpu().numpy()
@@ -934,74 +978,81 @@ class MoGeViewer:
                     if normal is not None:
                         normal = normal.cpu().numpy()
                     
-                    # Mesh geometry always uses model resolution (controlled by input_resolution_scale)
+                    print(f"Frame {frame_num}: points shape={points.shape}, depth shape={depth.shape}, mask shape={mask.shape}")
+                    
+                    # Use model resolution for geometry
                     final_points = points
                     final_depth = depth
                     final_mask = mask
                     final_normal = normal
                     final_width, final_height = model_width, model_height
                     
-                    # Texture resolution depends on full_resolution_output setting
+                    # Texture resolution handling
                     if self.full_resolution_output and self.input_resolution_scale != 1.0:
-                        # Use original high-resolution image for texture sampling
                         texture_image = self.apply_post_processing(original_image)
                         texture_width, texture_height = original_width, original_height
                     else:
-                        # Use model resolution image for texture
                         texture_image = model_image
                         texture_width, texture_height = model_width, model_height
                     
-                    # Clean mask
-                    if self.smooth_edges:
-                        depth_smooth = cv2.GaussianBlur(final_depth, (3, 3), 0.5)
-                        mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
-                    else:
-                        mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(final_depth, rtol=0.04)
+                    # Clean mask with error handling
+                    try:
+                        if self.smooth_edges:
+                            depth_smooth = cv2.GaussianBlur(final_depth, (3, 3), 0.5)
+                            mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(depth_smooth, rtol=0.025)
+                        else:
+                            mask_cleaned = final_mask & ~utils3d.numpy.depth_edge(final_depth, rtol=0.04)
+                    except:
+                        # Fallback to original mask if edge detection fails
+                        mask_cleaned = final_mask
                     
                     # Prepare texture for mesh generation
-                    # Always scale texture to match model resolution for proper UV mapping
                     if self.full_resolution_output and self.input_resolution_scale != 1.0:
-                        # Scale down the high-resolution texture to match model resolution for UV mapping
                         mesh_texture = cv2.resize(texture_image, (final_width, final_height), interpolation=cv2.INTER_LINEAR)
                     else:
                         mesh_texture = texture_image
                     
-                    # Create mesh with geometry at model resolution and colors from texture
-                    if final_normal is None:
-                        faces, vertices, vertex_colors, vertex_uvs = utils3d.numpy.image_mesh(
-                            final_points,
-                            mesh_texture.astype(np.float32) / 255,
-                            utils3d.numpy.image_uv(width=final_width, height=final_height),
-                            mask=mask_cleaned,
-                            tri=True
-                        )
-                        vertex_normals = None
-                    else:
-                        faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.numpy.image_mesh(
-                            final_points,
-                            mesh_texture.astype(np.float32) / 255,
-                            utils3d.numpy.image_uv(width=final_width, height=final_height),
-                            final_normal,
-                            mask=mask_cleaned,
-                            tri=True
-                        )
+                    # Create mesh with error handling
+                    try:
+                        if final_normal is None:
+                            faces, vertices, vertex_colors, vertex_uvs = utils3d.numpy.image_mesh(
+                                final_points,
+                                mesh_texture.astype(np.float32) / 255,
+                                utils3d.numpy.image_uv(width=final_width, height=final_height),
+                                mask=mask_cleaned,
+                                tri=True
+                            )
+                            vertex_normals = None
+                        else:
+                            faces, vertices, vertex_colors, vertex_uvs, vertex_normals = utils3d.numpy.image_mesh(
+                                final_points,
+                                mesh_texture.astype(np.float32) / 255,
+                                utils3d.numpy.image_uv(width=final_width, height=final_height),
+                                final_normal,
+                                mask=mask_cleaned,
+                                tri=True
+                            )
+                    except Exception as e:
+                        print(f"Error creating mesh for frame {frame_num}: {e}")
+                        # Mark as processed to avoid getting stuck
+                        with self.video_lock:
+                            self.processed_frames.add(frame_num)
+                        continue
                     
-                    # If full resolution output is enabled, resample vertex colors using proper UV mapping
-                    if self.full_resolution_output and self.input_resolution_scale != 1.0:
-                        # Use UV coordinates to sample from high-resolution texture - O(1) per vertex
-                        high_res_colors = texture_image.astype(np.float32) / 255.0
-                        texture_h, texture_w = texture_width, texture_height
-                        
-                        # Sample colors using UV coordinates (much more accurate than pixel indexing)
-                        for i in range(len(vertex_colors)):
-                            u, v = vertex_uvs[i]
-                            # Convert UV [0,1] to pixel coordinates in high-res texture
-                            x = int(u * (texture_w - 1))
-                            y = int(v * (texture_h - 1))
-                            # Clamp to texture bounds (redundant but safe)
-                            x = max(0, min(x, texture_w - 1))
-                            y = max(0, min(y, texture_h - 1))
-                            vertex_colors[i] = high_res_colors[y, x]
+                    # High-resolution texture sampling if enabled
+                    if (self.full_resolution_output and self.input_resolution_scale != 1.0 and 
+                        len(vertex_colors) > 0 and len(vertex_uvs) > 0):
+                        try:
+                            high_res_colors = texture_image.astype(np.float32) / 255.0
+                            texture_h, texture_w = texture_height, texture_width
+                            
+                            # Vectorized UV sampling for better performance
+                            u_coords = np.clip(vertex_uvs[:, 0] * (texture_w - 1), 0, texture_w - 1).astype(int)
+                            v_coords = np.clip(vertex_uvs[:, 1] * (texture_h - 1), 0, texture_h - 1).astype(int)
+                            vertex_colors = high_res_colors[v_coords, u_coords]
+                        except Exception as e:
+                            print(f"Error in high-res texture sampling for frame {frame_num}: {e}")
+                            # Continue with low-res colors
                     
                     # Convert coordinates
                     vertices = vertices * np.array([1, -1, -1], dtype=np.float32)
@@ -1016,25 +1067,35 @@ class MoGeViewer:
                         'vertex_normals': vertex_normals
                     }
                     
+                    print(f"Frame {frame_num}: Created mesh with {len(vertices)} vertices, {len(faces)} faces")
+                    
+                    # Update cache and status with proper locking
                     with self.video_lock:
                         # Add to cache
                         self.mesh_cache[frame_num] = mesh_data
                         self.processed_frames.add(frame_num)
                         
                         # Maintain cache size limit (LRU)
-                        if len(self.mesh_cache) > self.max_mesh_cache:
+                        while len(self.mesh_cache) > self.max_mesh_cache:
                             # Remove oldest entry
-                            self.mesh_cache.popitem(last=False)
+                            oldest_frame, _ = self.mesh_cache.popitem(last=False)
+                            print(f"Evicted frame {oldest_frame} from cache")
                         
                         # Update status
                         processed_count = len(self.processed_frames)
-                        percent = (processed_count / self.video_total_frames) * 100
-                        self.status_message = f"Processing: {percent:.1f}% ({processed_count}/{self.video_total_frames} frames)"
+                        if self.video_total_frames > 0:
+                            percent = (processed_count / self.video_total_frames) * 100
+                            self.status_message = f"Processing: {percent:.1f}% ({processed_count}/{self.video_total_frames} frames)"
                         
-                        # Auto-play when enough frames are buffered
-                        if not self.video_playing and processed_count >= 30:  # 1 second buffered
+                        # Auto-play when enough frames are buffered - start immediately for real-time
+                        if not self.video_playing and not self.video_is_seeking and processed_count >= 1:  # Start with just 1 frame for real-time
                             self.video_playing = True
                             self.video_last_frame_time = time.time()
+                            print(f"Auto-starting playback with {processed_count} frames processed")
+                    
+                    # Clear GPU memory periodically
+                    if frame_num % 50 == 0 and self.device.type == "cuda":
+                        torch.cuda.empty_cache()
                     
                 except Exception as e:
                     print(f"Error processing frame {frame_num}: {e}")
@@ -1045,139 +1106,216 @@ class MoGeViewer:
             except Exception as e:
                 print(f"Error in video processor thread: {e}")
                 time.sleep(0.1)
+                
+        print("Video processor thread stopped")
     
     def _buffer_video_frames(self):
         """Buffer video frames in background"""
+        print("Video buffer thread started")
+        
         while self.video_active:
             try:
-                # Handle seek requests
+                # Handle seek requests with proper synchronization
                 if self.video_seek_requested:
-                    self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, self.video_seek_frame)
                     with self.video_lock:
-                        self.video_current_frame = self.video_seek_frame
+                        seek_frame = self.video_seek_frame
                         self.video_seek_requested = False
-                        self.video_frame_buffer.clear()
+                        
+                    # Perform seek outside of lock to avoid blocking
+                    if self.video_capture and self.video_capture.isOpened():
+                        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, seek_frame)
+                        
+                        with self.video_lock:
+                            self.video_current_frame = seek_frame
+                            self.video_frame_buffer.clear()
+                            print(f"Seeked to frame {seek_frame}")
                 
-                # Buffer frames if not full
-                if len(self.video_frame_buffer) < self.video_frame_buffer.maxlen:
+                # Check if we should buffer more frames
+                with self.video_lock:
+                    buffer_size = len(self.video_frame_buffer)
+                    current_frame = self.video_current_frame
+                    
+                # Only buffer if we have space and video capture is valid
+                if (buffer_size < self.video_frame_buffer.maxlen and 
+                    self.video_capture and self.video_capture.isOpened()):
+                    
                     ret, frame = self.video_capture.read()
                     if ret:
-                        # No resizing - keep full resolution
+                        # Successfully read frame
                         with self.video_lock:
                             self.video_frame_buffer.append({
-                                'frame': frame,
-                                'number': self.video_current_frame
+                                'frame': frame.copy(),  # Make a copy to avoid reference issues
+                                'number': current_frame
                             })
                             self.video_current_frame += 1
+                            
+                        # Small delay to prevent overwhelming the system
+                        time.sleep(0.001)
                     else:
-                        # End of video
-                        if self.video_loop:
-                            # Loop video
-                            self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            with self.video_lock:
-                                self.video_current_frame = 0
-                        else:
-                            # Stop at end
-                            with self.video_lock:
-                                self.video_playing = False
-                            self.status_message = "Video ended"
-                            time.sleep(0.5)  # Avoid busy loop at end
+                        # End of video reached
+                        with self.video_lock:
+                            if self.video_loop and current_frame > 0:
+                                # Loop back to beginning
+                                print("Looping video")
+                                if self.video_capture and self.video_capture.isOpened():
+                                    self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                    self.video_current_frame = 0
+                            else:
+                                # In live mode, NEVER stop playback - loop anyway
+                                if self.video_live_mode:
+                                    print("Live mode: forcing loop at end")
+                                    if self.video_capture and self.video_capture.isOpened():
+                                        self.video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                        self.video_current_frame = 0
+                                else:
+                                    # Only stop in normal mode
+                                    self.video_playing = False
+                                    self.status_message = "Video ended"
+                                    print("Video ended")
+                        
+                        time.sleep(0.1)  # Longer sleep when at end
                 else:
-                    # Buffer is full
+                    # Buffer is full or paused - sleep to reduce CPU usage
                     with self.video_lock:
-                        if not self.video_playing:
-                            # Longer sleep when paused to reduce CPU usage
-                            time.sleep(0.5)
-                        else:
-                            time.sleep(0.01)  # Short sleep when playing
+                        is_playing = self.video_playing
+                        
+                    if is_playing:
+                        time.sleep(0.01)  # Short sleep when playing
+                    else:
+                        time.sleep(0.1)   # Longer sleep when paused
                     
             except Exception as e:
-                print(f"Error buffering video: {e}")
-                self.video_active = False
-                self.status_message = "Video error"
+                print(f"Error in video buffer thread: {e}")
+                with self.video_lock:
+                    self.video_active = False
+                self.status_message = "Video buffer error"
                 time.sleep(0.1)
+                
+        print("Video buffer thread stopped")
     
     def _play_video(self):
-        """Play video frames at correct FPS using cached meshes"""
+        """Play video frames - LIVE MODE NEVER STOPS"""
+        print("Video playback thread started")
         frame_interval = 1.0 / self.video_fps
         self.video_last_frame_time = time.time()
         
         while self.video_active:
             try:
+                # Get current state
                 with self.video_lock:
-                    playing = self.video_playing
-                    current_frame = self.video_current_frame
+                    live_mode = self.video_live_mode
+                    current_displayed_frame = max(0, self._current_displayed_frame)
+                    loop_enabled = self.video_loop
                     
-                if playing:
-                    current_time = time.time()
-                    elapsed = current_time - self.video_last_frame_time
-                    
-                    if elapsed >= frame_interval:
-                        # Determine next frame to display
-                        next_frame = current_frame
-                        
-                        with self.video_lock:
-                            if self.video_live_mode:
-                                # In live mode, skip to latest processed frame
-                                frames_behind = int(elapsed / frame_interval)
-                                target_frame = min(current_frame + frames_behind, self.video_total_frames - 1)
-                                
-                                # Find latest processed frame up to target
-                                for f in range(target_frame, current_frame - 1, -1):
-                                    if f in self.mesh_cache:
-                                        next_frame = f
-                                        break
-                            else:
-                                # Normal mode - play each frame in sequence
-                                next_frame = current_frame + 1
-                                if next_frame >= self.video_total_frames:
-                                    if self.video_loop:
-                                        next_frame = 0
-                                    else:
-                                        self.video_playing = False
-                                        self.status_message = "Video ended"
-                                        continue
-                        
-                            # Wait if frame not processed yet
-                            if next_frame not in self.mesh_cache:
-                                # Check if it will never be processed (beyond buffer)
-                                if next_frame not in self.processed_frames:
-                                    self.status_message = "Buffering..."
-                                    time.sleep(0.01)
-                                    continue
-                        
-                        # Display the frame if we have it cached
-                        if next_frame in self.mesh_cache:
-                            mesh_data = self.mesh_cache[next_frame]
-                            
-                            # Update mesh for display
-                            with self.mesh_lock:
-                                self.pending_mesh = {
-                                    'vertices': mesh_data['vertices'],
-                                    'faces': mesh_data['faces'],
-                                    'vertex_colors': mesh_data['vertex_colors'],
-                                    'vertex_normals': mesh_data['vertex_normals'],
-                                    'center': None,  # Don't reset camera
-                                    'scale': None
-                                }
-                            
-                            # Update current frame
-                            with self.video_lock:
-                                self.video_current_frame = next_frame
-                                self._current_displayed_frame = next_frame
-                                
-                                # Update status
-                                if self.status_message.startswith("Buffering") or self.status_message.startswith("Processing"):
-                                    self.status_message = "Video playing"
-                        
-                        self.video_last_frame_time = current_time
+                # LIVE MODE OVERRIDE: Always force playback on
+                if live_mode:
+                    with self.video_lock:
+                        if not self.video_playing:
+                            self.video_playing = True
+                            print("LIVE MODE: Force-enabled playback")
+                    playing = True
                 else:
-                    # Not playing
-                    time.sleep(0.01)
+                    with self.video_lock:
+                        playing = self.video_playing
+                
+                if not playing and not live_mode:
+                    time.sleep(0.05)
+                    continue
+                    
+                current_time = time.time()
+                elapsed = current_time - self.video_last_frame_time
+                
+                # Always advance in live mode, or when time elapsed in normal mode
+                should_advance = live_mode or (elapsed >= frame_interval)
+                
+                if should_advance:
+                    next_frame = current_displayed_frame
+                    
+                    # Get available frames
+                    with self.video_lock:
+                        available_frames = list(self.mesh_cache.keys())
+                    
+                    if live_mode:
+                        # LIVE MODE: Always jump to latest available frame
+                        if available_frames:
+                            latest_frame = max(available_frames)
+                            if latest_frame != current_displayed_frame:
+                                next_frame = latest_frame
+                                frames_skipped = abs(next_frame - current_displayed_frame)
+                                print(f"LIVE: jumped {frames_skipped} frames to {next_frame}")
+                            else:
+                                # Try to advance by 1
+                                candidate = current_displayed_frame + 1
+                                if candidate >= self.video_total_frames:
+                                    if loop_enabled:
+                                        next_frame = 0
+                                        print("LIVE: looped to start")
+                                elif candidate in available_frames:
+                                    next_frame = candidate
+                        else:
+                            # No frames available - advance anyway in live mode
+                            next_frame = (current_displayed_frame + 1) % self.video_total_frames if loop_enabled else min(current_displayed_frame + 1, self.video_total_frames - 1)
+                            print(f"LIVE: no frames available, advancing to {next_frame}")
+                    else:
+                        # NORMAL MODE: Sequential playback
+                        candidate = current_displayed_frame + 1
+                        if candidate >= self.video_total_frames:
+                            if loop_enabled:
+                                next_frame = 0
+                                print("Normal: looped to start")
+                            else:
+                                # Only stop in normal mode
+                                with self.video_lock:
+                                    self.video_playing = False
+                                self.status_message = "Video ended"
+                                continue
+                        elif candidate in available_frames:
+                            next_frame = candidate
+                        # else stay on current frame
+                    
+                    # Always try to display something
+                    with self.video_lock:
+                        mesh_data = self.mesh_cache.get(next_frame)
+                    
+                    if mesh_data:
+                        # Update mesh
+                        with self.mesh_lock:
+                            self.pending_mesh = {
+                                'vertices': mesh_data['vertices'],
+                                'faces': mesh_data['faces'],
+                                'vertex_colors': mesh_data['vertex_colors'],
+                                'vertex_normals': mesh_data['vertex_normals'],
+                                'center': None,
+                                'scale': None
+                            }
+                        
+                        # Update displayed frame
+                        with self.video_lock:
+                            self._current_displayed_frame = next_frame
+                        
+                        self.status_message = "Video playing"
+                    else:
+                        # No mesh data - in live mode, keep trying
+                        if live_mode:
+                            print(f"LIVE: Frame {next_frame} not ready, continuing...")
+                        else:
+                            self.status_message = "Buffering..."
+                    
+                    # Always update timing
+                    self.video_last_frame_time = current_time
+                
+                # Very short sleep
+                time.sleep(0.001)
                     
             except Exception as e:
-                print(f"Error playing video: {e}")
+                print(f"Error in video playback thread: {e}")
+                # In live mode, never let errors stop playback
+                if live_mode:
+                    with self.video_lock:
+                        self.video_playing = True
                 time.sleep(0.01)
+                
+        print("Video playback thread stopped")
     
     def _capture_frames(self):
         """Capture frames from camera in separate thread"""
@@ -2327,6 +2465,8 @@ class MoGeViewer:
         """Check for pending mesh updates and apply them on the main thread"""
         with self.mesh_lock:
             if self.pending_mesh is not None:
+                print(f"Processing pending mesh: {len(self.pending_mesh['vertices'])} vertices, {len(self.pending_mesh['faces'])} faces")
+                
                 # Update mesh data
                 self.vertices = self.pending_mesh['vertices']
                 self.faces = self.pending_mesh['faces']
@@ -2336,6 +2476,7 @@ class MoGeViewer:
                 
                 # Set mesh info for UI
                 self.mesh_info = f"{len(self.vertices):,} vertices, {len(self.faces):,} faces"
+                print(f"Mesh updated: {self.mesh_info}")
                 
                 # Reset camera if needed (for static images, but not during auto-refresh)
                 if self.pending_mesh['center'] is not None and not self.is_refreshing:
@@ -3255,7 +3396,7 @@ class MoGeViewer:
         
         # Get current playback position with thread safety
         with self.video_lock:
-            current_frame = self.video_current_frame
+            current_frame = self._current_displayed_frame if self._current_displayed_frame >= 0 else 0
             is_playing = self.video_playing
             is_seeking = self.video_is_seeking
         
@@ -3380,8 +3521,10 @@ class MoGeViewer:
             total_time,
             ""  # No format string, we display time separately
         )
-        if changed:
+        if changed and not is_seeking:
             new_frame = int(new_time * self.video_fps)
+            new_frame = max(0, min(new_frame, self.video_total_frames - 1))
+            print(f"Slider seek to frame {new_frame} (time {new_time:.2f}s)")
             self.seek_video(new_frame)
         imgui.pop_item_width()
         
@@ -3403,12 +3546,19 @@ class MoGeViewer:
         if imgui.is_item_hovered():
             imgui.set_tooltip("Loop video: restart from beginning when reaching the end")
         
-        # Live mode toggle
+        # Live mode toggle - make it more responsive
         imgui.same_line()
         imgui.set_cursor_pos_x(control_width - 110)
-        changed, self.video_live_mode = imgui.checkbox("Live", self.video_live_mode)
+        changed, new_live_mode = imgui.checkbox("Live", self.video_live_mode)
+        if changed:
+            # Update immediately without lock to be more responsive
+            self.video_live_mode = new_live_mode
+            print(f"Live mode {'enabled' if new_live_mode else 'disabled'}")
+            # Reset timing when toggling live mode
+            if self.video_playing:
+                self.video_last_frame_time = time.time()
         if imgui.is_item_hovered():
-            imgui.set_tooltip("Live: Drop frames to match video speed if behind")
+            imgui.set_tooltip("Live: Skip frames to maintain real-time playback speed")
         
         # Re-enable controls
         if is_seeking:
